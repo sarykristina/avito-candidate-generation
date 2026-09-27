@@ -76,8 +76,9 @@ def build_setup(t0):
     """Один раз выполнить всю дорогую подготовку: загрузить train.parquet,
     восстановить экземпляры запроса, разбить их на FIT/EVAL, собрать текст
     корпуса объявлений и обучить на нём BM25-индекс, построить
-    FIT-прайоры. Результат кэшируется в get_setup(), чтобы не повторять
-    эти шаги при каждом новом эксперименте с параметрами бустинга."""
+    FIT-прайоры (микрокатегория и локация). Результат кэшируется в
+    get_setup(), чтобы не повторять эти шаги при каждом новом эксперименте
+    с параметрами бустинга."""
     log(t0, "Загружаю train.parquet ...")
     train = pd.read_parquet("data/train.parquet")
     log(t0, f"строк={len(train)}  уникальных объявлений={train['item_id'].nunique()}")
@@ -116,6 +117,7 @@ def build_setup(t0):
     items = train.drop_duplicates("item_id").set_index("item_id").sort_index()
     item_ids = items.index.to_numpy()
     item_microcat = items["item_microcat_id"].to_numpy()
+    item_location = items["item_location_id"].to_numpy()
 
     log(t0, "Строю текст корпуса объявлений ...")
     item_texts = build_item_corpus_text(items)
@@ -128,6 +130,7 @@ def build_setup(t0):
     log(t0, "Строю текст EVAL-запросов ...")
     eval_query_texts = build_query_text(eval_query_df).tolist()
     eval_qtext_list = eval_query_df["_qtext_norm"].tolist()
+    eval_search_location = eval_query_df["search_location_id"].to_numpy()
     true_relevant = list(relevant_sets.values)
 
     # Prior "текст запроса -> распределение микрокатегорий" строится
@@ -140,7 +143,9 @@ def build_setup(t0):
 
     setup = dict(
         bm25=bm25, item_ids=item_ids, item_microcat=item_microcat,
+        item_location=item_location,
         eval_query_texts=eval_query_texts, eval_qtext_list=eval_qtext_list,
+        eval_search_location=eval_search_location,
         true_relevant=true_relevant, qtext_to_microcat=qtext_to_microcat,
         fit_qtext_series=fit_rows["_qtext_norm"], fit_item_series=fit_rows["item_id"],
     )
@@ -151,8 +156,9 @@ def get_setup(t0):
     """Загрузить закэшированную подготовку с диска, если она уже
     посчитана, иначе построить её заново и сохранить в кэш. Это чисто
     техническая оптимизация под итеративный подбор гиперпараметров бустов
-    (build_setup -- самая долгая часть, ~2-7 минут на полном
-    train.parquet, тогда как сам перебор вариантов бустинга -- секунды)."""
+    (build_setup -- самая долгая часть, ~1-7 минут на полном
+    train.parquet в зависимости от загрузки системы, тогда как сам
+    перебор вариантов бустинга -- секунды)."""
     if CACHE_PATH.exists():
         log(t0, f"Загружаю закэшированную подготовку из {CACHE_PATH} ...")
         with open(CACHE_PATH, "rb") as f:
@@ -175,11 +181,13 @@ def main():
     # отсортирован по возрастанию.
     assert (np.sort(s["item_ids"]) == s["item_ids"]).all()
 
-    def evaluate(alpha_microcat, memo_series, label):
+    def evaluate(label, **kwargs):
         ranked = rank_all(
             s["eval_query_texts"], s["eval_qtext_list"], s["bm25"],
-            s["item_ids"], s["item_microcat"], memo_series, s["qtext_to_microcat"],
-            k=K, alpha_microcat=alpha_microcat, chunk_size=CHUNK,
+            s["item_ids"], s["item_microcat"],
+            item_location=s["item_location"],
+            search_location_list=s["eval_search_location"],
+            k=K, chunk_size=CHUNK, **kwargs,
         )
         r, _ = recall_at_k(s["true_relevant"], ranked, k=K)
         log(t0, f"[{label}]  Recall@{K} = {r:.4f}")
@@ -187,31 +195,44 @@ def main():
 
     empty_series = pd.Series(dtype=object)
 
-    # 1) Чистый BM25 без каких-либо исторических бустов -- отправная точка
-    #    для сравнения всех последующих экспериментов.
-    evaluate(0.0, empty_series, "BASELINE только текстовый BM25")
+    # 1) Прямая проверка гипотезы "услуги Avito - локальный рынок": какая
+    #    доля выбранных в train.parquet объявлений находится ровно в той
+    #    же локации, что и сам поиск.
+    match_rate = (
+        pd.read_parquet("data/train.parquet", columns=["item_location_id", "search_location_id"])
+        .pipe(lambda df: (df["item_location_id"] == df["search_location_id"]).mean())
+    )
+    log(t0, f"Доля train-строк с item_location_id == search_location_id: {match_rate:.4f}")
 
-    # 2) Подбор ограничения меморизационного prior'а (max_distinct, top_n).
-    #    Без такого ограничения (см. src/ranking.py) recall катастрофически
-    #    падает из-за общих запросов вроде "маникюр" -- здесь мы наглядно
-    #    воспроизводим, как разные пороги влияют на итоговую метрику.
-    for max_distinct, top_n in [(1, 1), (3, 3), (5, 3), (10, 3)]:
-        memo = build_memo_prior(
-            s["fit_qtext_series"], s["fit_item_series"],
-            max_distinct=max_distinct, top_n=top_n,
-        )
-        evaluate(0.0, memo,
-                 f"BM25 + memo(max_distinct={max_distinct}, top_n={top_n}), без микрокатегории")
+    # 2) Чистый BM25 без каких-либо бустов -- отправная точка.
+    evaluate("BASELINE только текстовый BM25",
+             qtext_to_items=empty_series, qtext_to_microcat=empty_series,
+             alpha_microcat=0.0, alpha_location=0.0)
 
-    # 3) Взяв разумную конфигурацию меморизации (5, 3), перебираем вес
-    #    буста по микрокатегории -- чтобы честно проверить гипотезу, а
-    #    не просто выбросить её без замеров. Как показывает результат
-    #    (см. README.md), этот буст стабильно ВРЕДИТ recall, поэтому в
-    #    финальном пайплайне (scripts/generate_answer.py) он отключён.
+    # 3) Буст по локации -- главный найденный сигнал. Проверяем, что
+    #    результат выходит на плато уже при alpha=1.0 (когда буст
+    #    гарантированно перевешивает разницу BM25-скоров внутри запроса).
+    for alpha_loc in [0.1, 0.3, 0.5, 1.0, 2.0]:
+        evaluate(f"BM25 + локация(alpha={alpha_loc})",
+                 qtext_to_items=empty_series, qtext_to_microcat=empty_series,
+                 alpha_microcat=0.0, alpha_location=alpha_loc)
+
+    # 4) На базе локации(1.0) подбираем буст по микрокатегории. Без
+    #    локации этот буст стабильно вредил (см. README.md) - проверяем,
+    #    изменилось ли это теперь, когда кандидат-пул уже сужен географией.
+    for alpha_mc in [0.0, 0.1, 0.15, 0.2, 0.25, 0.3, 0.5, 1.0]:
+        evaluate(f"BM25 + локация(1.0) + микрокатегория(alpha={alpha_mc})",
+                 qtext_to_items=empty_series, qtext_to_microcat=s["qtext_to_microcat"],
+                 alpha_microcat=alpha_mc, alpha_location=1.0)
+
+    # 5) Меморизация поверх лучшей связки (локация + микрокатегория) -
+    #    проверяем, не потеряла ли она смысл теперь, когда локация уже
+    #    учтена явно (см. докстринг src/ranking.py).
     best_memo = build_memo_prior(s["fit_qtext_series"], s["fit_item_series"],
                                   max_distinct=5, top_n=3)
-    for alpha in [0.0, 0.3, 0.5, 1.0, 2.0]:
-        evaluate(alpha, best_memo, f"BM25 + memo(5,3) + микрокатегория(alpha={alpha})")
+    evaluate("BM25 + локация(1.0) + микрокатегория(0.2) + memo(5,3)",
+             qtext_to_items=best_memo, qtext_to_microcat=s["qtext_to_microcat"],
+             alpha_microcat=0.2, alpha_location=1.0)
 
     log(t0, "готово")
 
