@@ -17,18 +17,29 @@ README.ru.md):
      запрос x объявление слишком плотной, чтобы уместиться в памяти.
   2. Текст запроса строится аналогично (search_query x5 + фильтры x3) и
      сравнивается с BM25-индексом порциями, ограниченными по памяти.
-  3. Поверх BM25-скора накладывается исторический prior, выученный по
+  3. Поверх BM25-скора накладываются два прайора, выученных по
      ВСЕМУ train.parquet (разметки бенчмарка не существует, и она нигде
      не используется):
-       - меморизационный бонус, который принудительно добавляет в
-         кандидаты любой item_id, исторически выбиравшийся для точно
-         такого же текста запроса и всё ещё существующий в
-         benchmark_items.parquet -- но ТОЛЬКО если у этого текста запроса
-         небольшое (см. MEMO_MAX_DISTINCT) число разных исторических
-         объявлений, иначе сигнал зашумляет ранжирование (см. ниже).
-       - буст по микрокатегории в этом финальном пайплайне ОТКЛЮЧЁН
-         (ALPHA_MICROCAT=0.0), потому что в офлайн-валидации он
-         стабильно ухудшал Recall@50.
+       - буст по локации (item_location_id == search_location_id) --
+         ГЛАВНЫЙ сигнал в этом решении: у 83.1% объявлений, реально
+         выбранных пользователями в train.parquet, локация объявления
+         совпадает с локацией поиска. Услуги на Avito -- это локальный
+         рынок, и один текстовый BM25 систематически предпочитает
+         текстово похожие, но географически нерелевантные объявления
+         из других городов. Этот единственный буст поднял офлайн
+         Recall@50 с 0.184 до 0.735 (см. README.md).
+       - буст по микрокатегории, которую пользователи исторически
+         выбирали для этого текста запроса. Сам по себе (без буста по
+         локации) этот буст стабильно вредил Recall@50, поэтому раньше
+         был отключён -- но вместе с локацией он, наоборот, помогает
+         (см. README.md и docstring src/ranking.py), поэтому включён с
+         небольшим весом.
+     Меморизация точных исторических объявлений (была в более ранней
+     версии решения) больше не используется: после добавления буста по
+     локации она перестала давать прирост (см. README.md) -- один и тот
+     же текст запроса в разных городах ведёт к разным объявлениям, и
+     "средний по стране" исторический ответ уже не нужен, когда локация
+     учтена явно.
   4. Топ-50 объявлений на запрос (по итоговому скору) записываются в
      answer.csv, дополнительно проходя проверку на соответствие всем
      требованиям формата из задания.
@@ -44,29 +55,23 @@ import pandas as pd
 sys.path.insert(0, ".")
 from src.data_prep import build_item_corpus_text, build_query_text, normalize_query_text
 from src.bm25 import BM25Index
-from src.ranking import rank_all, build_memo_prior
+from src.ranking import rank_all
 
 K = 50
 
 # Значения ниже выбраны по итогам офлайн-сравнения в
-# scripts/run_validation.py (полные цифры -- в README.md):
-#   - буст по микрокатегории СТАБИЛЬНО УХУДШАЛ Recall@50
-#     (0.182 -> 0.176 по мере роста веса буста), поэтому он отключён
-#     здесь (ALPHA_MICROCAT=0.0), хотя код буста остаётся рабочим в
-#     src/ranking.py -- это осознанный отрицательный результат, а не
-#     недоделанная функциональность.
-#   - меморизационный prior по историческим объявлениям даёт небольшой,
-#     но бесплатный прирост (+0.001..0.0013 Recall@50 офлайн), если
-#     ограничить его текстами запроса с небольшим (<=MEMO_MAX_DISTINCT)
-#     числом различных исторических объявлений -- без этого ограничения
-#     он, наоборот, обрушивает recall (0.182 -> 0.150), потому что общие
-#     однословные запросы вроде "маникюр" имеют тысячи разных
-#     исторических объявлений по всей стране (по одному на исполнителя
-#     в каждом городе), и форсировать их все в топ-50 значит вытеснить
-#     оттуда специфичные для этого конкретного запроса кандидаты BM25.
-ALPHA_MICROCAT = 0.0
-MEMO_MAX_DISTINCT = 5
-MEMO_TOP_N = 3
+# scripts/run_validation.py (полные цифры и объяснение -- в README.md):
+#   - ALPHA_LOCATION=1.0 -- буст по локации выходит на плато уже при
+#     alpha=1.0 (дальнейшее увеличение вплоть до 50 не меняет Recall@50:
+#     0.7344 во всех случаях), потому что при alpha=1.0 добавка уже
+#     гарантированно перевешивает любую разницу чистых BM25-скоров внутри
+#     одного запроса. Берём наименьшее значение, при котором достигается
+#     этот эффект -- по той же логике, что и при подборе весов полей в
+#     src/data_prep.py.
+#   - ALPHA_MICROCAT=0.2 -- подобран отдельным перебором ПОСЛЕ включения
+#     буста по локации (без локации этот буст вредил и был отключён).
+ALPHA_LOCATION = 1.0
+ALPHA_MICROCAT = 0.2
 MAX_DF = 0.4
 CHUNK = 200
 
@@ -82,21 +87,21 @@ def main():
     t0 = time.time()
     log(t0, "Загружаю данные ...")
     # Из train.parquet нужны только колонки, реально участвующие в
-    # построении исторического prior'а -- явное перечисление колонок
-    # заметно ускоряет чтение parquet (не тянем текстовые поля
-    # объявлений/запросов, которые здесь не нужны) и экономит память.
-    train = pd.read_parquet("data/train.parquet",
-                             columns=["search_query", "item_id", "item_microcat_id"])
+    # построении исторических prior'ов -- явное перечисление колонок
+    # заметно ускоряет чтение parquet и экономит память.
+    train = pd.read_parquet(
+        "data/train.parquet",
+        columns=["search_query", "item_id", "item_microcat_id"],
+    )
     items = pd.read_parquet("data/benchmark_items.parquet").set_index("item_id").sort_index()
     queries = pd.read_parquet("data/benchmark_queries.parquet")
     log(t0, f"train={len(train)}  объявлений={len(items)}  запросов={len(queries)}")
 
-    # items отсортирован по item_id (см. .sort_index() выше) -- это
-    # нужно для np.searchsorted внутри boosted_top_k (src/ranking.py),
-    # когда меморизационный prior добавляет объявление, которого BM25
-    # сам по себе не нашёл.
+    # items отсортирован по item_id (см. .sort_index() выше) -- нужно для
+    # np.searchsorted внутри boosted_top_k (src/ranking.py).
     item_ids = items.index.to_numpy()
     item_microcat = items["item_microcat_id"].to_numpy()
+    item_location = items["item_location_id"].to_numpy()
 
     log(t0, "Строю текст корпуса объявлений и обучаю BM25-индекс ...")
     item_texts = build_item_corpus_text(items)
@@ -105,27 +110,28 @@ def main():
 
     log(t0, "Строю текст запросов ...")
     query_texts = build_query_text(queries).tolist()
-    # Отдельно нормализованный "сырой" текст запроса (без взвешивания
-    # полей) -- используется как ключ словаря в историческом
-    # prior'е qtext_to_items, а не для самого BM25-скора.
+    # Нормализованный "сырой" текст запроса -- ключ словаря для
+    # qtext_to_microcat (микрокатегорийный prior строится по точному
+    # совпадению текста запроса, а не по взвешенному BM25-тексту).
     qtext_norm_list = normalize_query_text(queries["search_query"]).tolist()
+    search_location_list = queries["search_location_id"].to_numpy()
 
-    log(t0, "Строю исторические priors по train.parquet ...")
+    log(t0, "Строю исторический prior по микрокатегориям из train.parquet ...")
     train["_qtext_norm"] = normalize_query_text(train["search_query"])
-    qtext_to_items = build_memo_prior(
-        train["_qtext_norm"], train["item_id"],
-        max_distinct=MEMO_MAX_DISTINCT, top_n=MEMO_TOP_N,
+    qtext_to_microcat = train.groupby("_qtext_norm")["item_microcat_id"].agg(
+        lambda x: x.value_counts(normalize=True).to_dict()
     )
-    # Буст по микрокатегории отключён (ALPHA_MICROCAT=0.0, см. выше) --
-    # пустой Series здесь просто гарантирует, что соответствующая ветка
-    # внутри boosted_top_k всегда будет no-op, без завязки на то, что
-    # вызывающий код обязательно передаст alpha_microcat=0.0.
-    qtext_to_microcat = pd.Series(dtype=object)
+    # Меморизация точных объявлений (qtext_to_items) в этом пайплайне не
+    # используется -- см. докстринг модуля и README.md: после добавления
+    # буста по локации она перестала давать прирост.
+    qtext_to_items = pd.Series(dtype=object)
 
     log(t0, "Считаю скор и ранжирую (BM25 + priors, порциями) ...")
     ranked = rank_all(
         query_texts, qtext_norm_list, bm25, item_ids, item_microcat,
-        qtext_to_items, qtext_to_microcat, k=K, alpha_microcat=ALPHA_MICROCAT,
+        qtext_to_items, qtext_to_microcat,
+        item_location=item_location, search_location_list=search_location_list,
+        k=K, alpha_microcat=ALPHA_MICROCAT, alpha_location=ALPHA_LOCATION,
         chunk_size=CHUNK,
     )
     log(t0, "ранжирование завершено")
@@ -136,16 +142,14 @@ def main():
     # словаря). Пустая строка кандидатов формально допустима форматом
     # answer.csv, но заведомо даёт recall=0 для этого запроса и выглядит
     # как недоработка -- вместо неё подставляем самые "проверенные"
-    # (с наибольшим числом отзывов) объявления той же категории.
-    # Ожидаемая польза для recall близка к нулю (случай очень редкий и
-    # угадать конкретное объявление здесь почти невозможно), но это
-    # строго не хуже пустого ответа и не портит остальные запросы.
-    popularity_fallback = (
-        items.sort_values("item_rating_reviews_count", ascending=False).index.to_numpy()
-    )
+    # (с наибольшим числом отзывов) объявления той же категории и
+    # локации, если такие есть, иначе просто той же категории.
     n_empty = sum(1 for r in ranked if len(r) == 0)
     if n_empty:
         log(t0, f"{n_empty} запрос(ов) получили 0 кандидатов -- применяю fallback по популярности")
+        popularity_fallback = (
+            items.sort_values("item_rating_reviews_count", ascending=False).index.to_numpy()
+        )
         cat_to_fallback = {}
         for cat, grp in items.groupby("item_category_id"):
             cat_to_fallback[cat] = grp.sort_values(
@@ -154,10 +158,14 @@ def main():
         for i, r in enumerate(ranked):
             if len(r) == 0:
                 cat = queries["search_category"].iloc[i]
-                # если такой категории вдруг нет среди объявлений
-                # (не должно случаться на этом датасете, но на всякий
-                # случай) -- откатываемся к глобальному топу по популярности.
-                ranked[i] = cat_to_fallback.get(cat, popularity_fallback[:K])
+                loc = search_location_list[i]
+                same_loc = items[(items["item_category_id"] == cat) & (item_location == loc)]
+                if len(same_loc):
+                    ranked[i] = same_loc.sort_values(
+                        "item_rating_reviews_count", ascending=False
+                    ).index.to_numpy()[:K]
+                else:
+                    ranked[i] = cat_to_fallback.get(cat, popularity_fallback[:K])
 
     answer = pd.DataFrame({
         "query_id": queries["query_id"].tolist(),
