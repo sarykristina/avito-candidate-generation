@@ -145,12 +145,17 @@ def build_setup(t0):
     qtext_to_microcat = fit_by_qtext["item_microcat_id"].agg(
         lambda s: s.value_counts(normalize=True).to_dict()
     )
-    location_redirect = build_location_redirect(
+    location_redirect, location_redirect_confidence = build_location_redirect(
         fit_rows["search_location_id"], fit_rows["item_location_id"]
     )
     eval_search_location_redirect = (
         eval_query_df["search_location_id"].map(location_redirect)
         .fillna(eval_query_df["search_location_id"])
+        .to_numpy()
+    )
+    eval_search_location_redirect_confidence = (
+        eval_query_df["search_location_id"].map(location_redirect_confidence)
+        .fillna(1.0)
         .to_numpy()
     )
 
@@ -160,6 +165,7 @@ def build_setup(t0):
         eval_query_texts=eval_query_texts, eval_qtext_list=eval_qtext_list,
         eval_search_location=eval_search_location,
         eval_search_location_redirect=eval_search_location_redirect,
+        eval_search_location_redirect_confidence=eval_search_location_redirect_confidence,
         true_relevant=true_relevant, qtext_to_microcat=qtext_to_microcat,
         fit_qtext_series=fit_rows["_qtext_norm"], fit_item_series=fit_rows["item_id"],
     )
@@ -195,7 +201,7 @@ def main():
     # отсортирован по возрастанию.
     assert (np.sort(s["item_ids"]) == s["item_ids"]).all()
 
-    def evaluate(label, use_redirect=True, **kwargs):
+    def evaluate(label, use_redirect=True, weight_redirect=True, **kwargs):
         ranked = rank_all(
             s["eval_query_texts"], s["eval_qtext_list"], s["bm25"],
             s["item_ids"], s["item_microcat"],
@@ -203,6 +209,10 @@ def main():
             search_location_list=s["eval_search_location"],
             search_location_redirect_list=(
                 s["eval_search_location_redirect"] if use_redirect else None
+            ),
+            search_location_redirect_confidence=(
+                s["eval_search_location_redirect_confidence"]
+                if use_redirect and weight_redirect else None
             ),
             k=K, chunk_size=CHUNK, **kwargs,
         )
@@ -236,27 +246,40 @@ def main():
     #    города/районы без своих исполнителей) - прямой буст для них
     #    бесполезен. Проверяем эффект отдельно и в объединении с прямым
     #    совпадением (см. src/ranking.py, build_location_redirect).
-    evaluate("BM25 + локация(1.0) С редиректом (union)", use_redirect=True,
+    #    Полносильный редирект (weight_redirect=False) сравнивается со
+    #    взвешенным по уверенности (weight_redirect=True, по умолчанию) -
+    #    см. пункт 5 ниже, где эта разница особенно заметна.
+    evaluate("BM25 + локация(1.0) С редиректом, полносильно", use_redirect=True,
+             weight_redirect=False,
+             qtext_to_items=empty_series, qtext_to_microcat=empty_series,
+             alpha_microcat=0.0, alpha_location=1.0)
+    evaluate("BM25 + локация(1.0) С редиректом, взвешенным по уверенности", use_redirect=True,
+             weight_redirect=True,
              qtext_to_items=empty_series, qtext_to_microcat=empty_series,
              alpha_microcat=0.0, alpha_location=1.0)
 
-    # 5) На базе локации(1.0)+редирект подбираем буст по микрокатегории.
-    #    Без буста по локации этот сигнал стабильно вредил (см. README.md) -
-    #    проверяем итоговый оптимум веса теперь, когда кандидат-пул уже
-    #    сужен географией.
+    # 5) На базе локации(1.0)+редирект(взвешенный) подбираем буст по
+    #    микрокатегории. Без буста по локации этот сигнал стабильно
+    #    вредил (см. README.md) - проверяем итоговый оптимум веса теперь,
+    #    когда кандидат-пул уже сужен географией.
     for alpha_mc in [0.0, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5]:
-        evaluate(f"BM25 + локация(1.0)+редирект + микрокатегория(alpha={alpha_mc})",
-                 use_redirect=True,
+        evaluate(f"BM25 + локация(1.0)+редирект(взвеш.) + микрокатегория(alpha={alpha_mc})",
+                 use_redirect=True, weight_redirect=True,
                  qtext_to_items=empty_series, qtext_to_microcat=s["qtext_to_microcat"],
                  alpha_microcat=alpha_mc, alpha_location=1.0)
 
     # 6) Меморизация поверх лучшей связки - проверяем, не потеряла ли она
     #    смысл теперь, когда локация (и её редирект) уже учтены явно (см.
-    #    докстринг src/ranking.py).
+    #    докстринг src/ranking.py). Дополнительно проверяем вариант,
+    #    привязанный не только к тексту запроса, но и к его локации
+    #    (обусловленный на пару (текст, search_location_id) вместо
+    #    одного текста) - гораздо более точный ключ: 81% таких пар в
+    #    train.parquet дают ровно один уникальный исторический ответ
+    #    против 60% для одного только текста.
     best_memo = build_memo_prior(s["fit_qtext_series"], s["fit_item_series"],
                                   max_distinct=5, top_n=3)
-    evaluate("BM25 + локация(1.0)+редирект + микрокатегория(0.2) + memo(5,3)",
-             use_redirect=True,
+    evaluate("BM25 + локация(1.0)+редирект(взвеш.) + микрокатегория(0.2) + memo по тексту(5,3)",
+             use_redirect=True, weight_redirect=True,
              qtext_to_items=best_memo, qtext_to_microcat=s["qtext_to_microcat"],
              alpha_microcat=0.2, alpha_location=1.0)
 
