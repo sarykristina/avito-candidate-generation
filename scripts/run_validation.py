@@ -54,7 +54,7 @@ sys.path.insert(0, ".")
 from src.data_prep import build_item_corpus_text, build_query_text, normalize_query_text
 from src.bm25 import BM25Index
 from src.eval_utils import recall_at_k
-from src.ranking import rank_all, build_memo_prior, build_location_redirect
+from src.ranking import rank_all, build_memo_prior, build_location_redirect, build_location_index
 
 RNG_SEED = 42          # фиксированный seed -> разбиение FIT/EVAL воспроизводимо
 K = 50                 # то же K, что и в задании (Recall@50)
@@ -157,9 +157,13 @@ def build_setup(t0):
         .tolist()
     )
 
+    # Индекс "локация -> позиции объявлений" -- нужен для гарантированного
+    # расширения кандидатов по локации (см. src/ranking.py, "ПЯТЫЙ СЛОЙ").
+    location_index = build_location_index(item_location)
+
     setup = dict(
         bm25=bm25, item_ids=item_ids, item_microcat=item_microcat,
-        item_location=item_location,
+        item_location=item_location, location_index=location_index,
         eval_query_texts=eval_query_texts, eval_qtext_list=eval_qtext_list,
         eval_search_location=eval_search_location,
         eval_search_location_redirect_targets=eval_search_location_redirect_targets,
@@ -213,13 +217,14 @@ def main():
             out.append(row)
         return out
 
-    def evaluate(label, redirect_top_n=5, weight_redirect=True, **kwargs):
+    def evaluate(label, redirect_top_n=5, weight_redirect=True, use_location_index=False, **kwargs):
         ranked = rank_all(
             s["eval_query_texts"], s["eval_qtext_list"], s["bm25"],
             s["item_ids"], s["item_microcat"],
             item_location=s["item_location"],
             search_location_list=s["eval_search_location"],
             search_location_redirect_targets=make_targets(redirect_top_n, weight_redirect),
+            location_index=s["location_index"] if use_location_index else None,
             k=K, chunk_size=CHUNK, **kwargs,
         )
         r, _ = recall_at_k(s["true_relevant"], ranked, k=K)
@@ -291,6 +296,47 @@ def main():
     evaluate("BM25 + локация(1.0)+редирект(top-5) + микрокатегория(0.2) + memo по тексту(5,3)",
              redirect_top_n=5, weight_redirect=True,
              qtext_to_items=best_memo, qtext_to_microcat=s["qtext_to_microcat"],
+             alpha_microcat=0.2, alpha_location=1.0)
+
+    # 8) Диагностика "слепой зоны" текстового поиска: сколько релевантных
+    #    объявлений лежат в правильной локации, но не имеют вообще НИ
+    #    ОДНОГО общего слова с запросом -- BM25 в принципе не мог их
+    #    найти, сколько бы буста по локации ни давали (см. докстринг
+    #    src/ranking.py, "ПЯТЫЙ СЛОЙ").
+    item_id_to_pos = {iid: pos for pos, iid in enumerate(s["item_ids"])}
+    q_all = s["bm25"].transform_query(s["eval_query_texts"])
+    scores_all = (q_all @ s["bm25"].bm25_matrix.T).tocsr()
+    n_total_rel, n_in_loc, n_in_loc_no_text = 0, 0, 0
+    for i, relevant in enumerate(s["true_relevant"]):
+        if not relevant:
+            continue
+        target_locs = {s["eval_search_location"][i]} | {
+            loc for loc, _ in s["eval_search_location_redirect_targets"][i][:5]
+        }
+        row_start, row_end = scores_all.indptr[i], scores_all.indptr[i + 1]
+        cols_with_score = set(scores_all.indices[row_start:row_end].tolist())
+        for item_id in relevant:
+            n_total_rel += 1
+            pos = item_id_to_pos.get(item_id)
+            if pos is None or s["item_location"][pos] not in target_locs:
+                continue
+            n_in_loc += 1
+            if pos not in cols_with_score:
+                n_in_loc_no_text += 1
+    log(t0, f"Релевантных объявлений в правильной локации, но с нулевым "
+             f"пересечением слов с запросом: {n_in_loc_no_text}/{n_in_loc} "
+             f"({n_in_loc_no_text/n_in_loc:.1%} среди 'локальных', "
+             f"{n_in_loc_no_text/n_total_rel:.1%} от всех релевантных)")
+
+    # 9) Расширение кандидатов по локации (build_location_index): проверяем
+    #    ограничение сверху на размер локации (чтобы не тащить тысячи
+    #    объявлений мегагородов в каждый запрос) и без ограничения вовсе.
+    #    Без ограничения оказалось лучше всего -- добавление кандидатов
+    #    может только помочь (топ-50 всё равно выбирается по итоговому
+    #    скору) и никогда не вредит, только чуть замедляет расчёт.
+    evaluate("BM25 + локация(1.0)+редирект(top-5) + микрокатегория(0.2) + расширение по локации",
+             redirect_top_n=5, weight_redirect=True, use_location_index=True,
+             qtext_to_items=empty_series, qtext_to_microcat=s["qtext_to_microcat"],
              alpha_microcat=0.2, alpha_location=1.0)
 
     log(t0, "готово")
