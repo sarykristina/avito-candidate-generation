@@ -17,29 +17,28 @@ README.ru.md):
      запрос x объявление слишком плотной, чтобы уместиться в памяти.
   2. Текст запроса строится аналогично (search_query x5 + фильтры x3) и
      сравнивается с BM25-индексом порциями, ограниченными по памяти.
-  3. Поверх BM25-скора накладываются два прайора, выученных по
-     ВСЕМУ train.parquet (разметки бенчмарка не существует, и она нигде
-     не используется):
-       - буст по локации (item_location_id == search_location_id) --
-         ГЛАВНЫЙ сигнал в этом решении: у 83.1% объявлений, реально
-         выбранных пользователями в train.parquet, локация объявления
-         совпадает с локацией поиска. Услуги на Avito -- это локальный
-         рынок, и один текстовый BM25 систематически предпочитает
-         текстово похожие, но географически нерелевантные объявления
-         из других городов. Этот единственный буст поднял офлайн
-         Recall@50 с 0.184 до 0.735 (см. README.md).
+  3. Поверх BM25-скора накладываются прайоры, выученные по ВСЕМУ
+     train.parquet (разметки бенчмарка не существует, и она нигде не
+     используется):
+       - буст по локации -- ГЛАВНЫЙ сигнал в этом решении: у 83.1%
+         объявлений, реально выбранных пользователями в train.parquet,
+         локация объявления совпадает с локацией поиска. Услуги на
+         Avito -- это локальный рынок, и один текстовый BM25
+         систематически предпочитает текстово похожие, но географически
+         нерелевантные объявления из других городов.
+       - "редирект" локации поверх этого же буста: у 17.4% запросов
+         бенчмарка нет вообще ни одного объявления с тем же
+         search_location_id в корпусе (маленький город/район без своих
+         исполнителей) -- для них прямое совпадение не срабатывает.
+         `build_location_redirect` учит по train.parquet, в какой
+         "хаб" (обычно ближайший крупный город) реально ведут такие
+         поиски, и буст проверяет совпадение с ЛЮБОЙ из двух локаций.
        - буст по микрокатегории, которую пользователи исторически
-         выбирали для этого текста запроса. Сам по себе (без буста по
-         локации) этот буст стабильно вредил Recall@50, поэтому раньше
-         был отключён -- но вместе с локацией он, наоборот, помогает
-         (см. README.md и docstring src/ranking.py), поэтому включён с
-         небольшим весом.
+         выбирали для этого текста запроса -- полезен именно вместе с
+         бустом по локации (см. src/ranking.py).
      Меморизация точных исторических объявлений (была в более ранней
-     версии решения) больше не используется: после добавления буста по
-     локации она перестала давать прирост (см. README.md) -- один и тот
-     же текст запроса в разных городах ведёт к разным объявлениям, и
-     "средний по стране" исторический ответ уже не нужен, когда локация
-     учтена явно.
+     версии решения) не используется -- перестала давать прирост после
+     добавления буста по локации (см. README.md).
   4. Топ-50 объявлений на запрос (по итоговому скору) записываются в
      answer.csv, дополнительно проходя проверку на соответствие всем
      требованиям формата из задания.
@@ -55,21 +54,22 @@ import pandas as pd
 sys.path.insert(0, ".")
 from src.data_prep import build_item_corpus_text, build_query_text, normalize_query_text
 from src.bm25 import BM25Index
-from src.ranking import rank_all
+from src.ranking import rank_all, build_location_redirect
 
 K = 50
 
 # Значения ниже выбраны по итогам офлайн-сравнения в
 # scripts/run_validation.py (полные цифры и объяснение -- в README.md):
 #   - ALPHA_LOCATION=1.0 -- буст по локации выходит на плато уже при
-#     alpha=1.0 (дальнейшее увеличение вплоть до 50 не меняет Recall@50:
-#     0.7344 во всех случаях), потому что при alpha=1.0 добавка уже
-#     гарантированно перевешивает любую разницу чистых BM25-скоров внутри
-#     одного запроса. Берём наименьшее значение, при котором достигается
-#     этот эффект -- по той же логике, что и при подборе весов полей в
-#     src/data_prep.py.
+#     alpha=1.0 (дальнейшее увеличение вплоть до 50 не меняет Recall@50),
+#     потому что при alpha=1.0 добавка уже гарантированно перевешивает
+#     любую разницу чистых BM25-скоров внутри одного запроса. Берём
+#     наименьшее значение, при котором достигается этот эффект -- по той
+#     же логике, что и при подборе весов полей в src/data_prep.py.
 #   - ALPHA_MICROCAT=0.2 -- подобран отдельным перебором ПОСЛЕ включения
-#     буста по локации (без локации этот буст вредил и был отключён).
+#     буста по локации (без локации этот буст вредил и был отключён);
+#     на выборке в 8000 offline-запросов пик находится в районе 0.2-0.3
+#     (различия там уже в пределах шума), берём середину этого плато.
 ALPHA_LOCATION = 1.0
 ALPHA_MICROCAT = 0.2
 MAX_DF = 0.4
@@ -91,7 +91,8 @@ def main():
     # заметно ускоряет чтение parquet и экономит память.
     train = pd.read_parquet(
         "data/train.parquet",
-        columns=["search_query", "item_id", "item_microcat_id"],
+        columns=["search_query", "item_id", "item_microcat_id",
+                 "search_location_id", "item_location_id"],
     )
     items = pd.read_parquet("data/benchmark_items.parquet").set_index("item_id").sort_index()
     queries = pd.read_parquet("data/benchmark_queries.parquet")
@@ -116,10 +117,23 @@ def main():
     qtext_norm_list = normalize_query_text(queries["search_query"]).tolist()
     search_location_list = queries["search_location_id"].to_numpy()
 
-    log(t0, "Строю исторический prior по микрокатегориям из train.parquet ...")
+    log(t0, "Строю исторические priors из train.parquet (микрокатегория, редирект локации) ...")
     train["_qtext_norm"] = normalize_query_text(train["search_query"])
     qtext_to_microcat = train.groupby("_qtext_norm")["item_microcat_id"].agg(
         lambda x: x.value_counts(normalize=True).to_dict()
+    )
+    location_redirect = build_location_redirect(
+        train["search_location_id"], train["item_location_id"]
+    )
+    # Если для какого-то search_location_id из бенчмарка вообще не было
+    # строк в train.parquet (не должно случаться -- все 58 "проблемных"
+    # локаций бенчмарка встретились в train.parquet, см. README.md), на
+    # всякий случай откатываемся на саму локацию поиска (тогда буст по
+    # редиректу просто выродится в обычное прямое совпадение).
+    search_location_redirect_list = (
+        queries["search_location_id"].map(location_redirect)
+        .fillna(queries["search_location_id"])
+        .to_numpy()
     )
     # Меморизация точных объявлений (qtext_to_items) в этом пайплайне не
     # используется -- см. докстринг модуля и README.md: после добавления
@@ -131,6 +145,7 @@ def main():
         query_texts, qtext_norm_list, bm25, item_ids, item_microcat,
         qtext_to_items, qtext_to_microcat,
         item_location=item_location, search_location_list=search_location_list,
+        search_location_redirect_list=search_location_redirect_list,
         k=K, alpha_microcat=ALPHA_MICROCAT, alpha_location=ALPHA_LOCATION,
         chunk_size=CHUNK,
     )
@@ -143,7 +158,8 @@ def main():
     # answer.csv, но заведомо даёт recall=0 для этого запроса и выглядит
     # как недоработка -- вместо неё подставляем самые "проверенные"
     # (с наибольшим числом отзывов) объявления той же категории и
-    # локации, если такие есть, иначе просто той же категории.
+    # локации (с учётом редиректа), если такие есть, иначе просто той же
+    # категории.
     n_empty = sum(1 for r in ranked if len(r) == 0)
     if n_empty:
         log(t0, f"{n_empty} запрос(ов) получили 0 кандидатов -- применяю fallback по популярности")
@@ -158,8 +174,9 @@ def main():
         for i, r in enumerate(ranked):
             if len(r) == 0:
                 cat = queries["search_category"].iloc[i]
-                loc = search_location_list[i]
-                same_loc = items[(items["item_category_id"] == cat) & (item_location == loc)]
+                loc_mask = (item_location == search_location_list[i]) | \
+                           (item_location == search_location_redirect_list[i])
+                same_loc = items[(items["item_category_id"] == cat) & loc_mask]
                 if len(same_loc):
                     ranked[i] = same_loc.sort_values(
                         "item_rating_reviews_count", ascending=False
