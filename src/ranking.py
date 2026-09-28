@@ -94,7 +94,21 @@
    объявлений одного города (или его хабов), и небольшая добавка
    категорийного prior'а помогает разрешить оставшуюся неоднозначность.
 
-2. Историческая "меморизация" точного объявления: если этот же самый
+2. Нечёткое сопоставление по символьным n-граммам (`src/fuzzy.py`):
+   дополнительный, небольшой по весу сигнал поверх точного по словам
+   BM25. Особенно полезен для объявлений, попавших в кандидаты только
+   через расширение по локации (см. выше) с нулевым BM25-скором -- для
+   них символьное сходство даёт хоть какой-то текстовый сигнал вместо
+   полного нуля, а не только для случаев с опечатками/словоформами.
+   Офлайн-валидация показала узкий, но реальный плюс: пик на
+   `alpha_fuzzy=0.1` (+0.0034 Recall@50), при весе заметно больше 0.3
+   recall начинает УХУДШАТЬСЯ (символьное сходство само по себе гораздо
+   более шумный сигнал, чем точное совпадение слов, и при большом весе
+   начинает перевешивать надёжные сигналы вместо того, чтобы просто
+   "дозаполнять" их слепые зоны). Подробности формулы -- в
+   src/fuzzy.py.
+
+3. Историческая "меморизация" точного объявления: если этот же самый
    текст запроса раньше уже приводил к конкретному item_id, который
    всё ещё существует в текущем корпусе, это объявление принудительно
    попадает в список кандидатов. САМ ПО СЕБЕ (до буста по локации) это
@@ -219,9 +233,12 @@ def rank_all(
     search_location_list=None,
     search_location_redirect_targets=None,
     location_index=None,
+    fuzzy_index=None,
+    fuzzy_query_texts=None,
     k=50,
     alpha_microcat=0.5,
     alpha_location=0.0,
+    alpha_fuzzy=0.0,
     memo_bonus=1e6,
     chunk_size=200,
 ):
@@ -235,7 +252,15 @@ def rank_all(
     location_index -- см. boosted_top_k; можно оставить None (или
     alpha_location=0.0), если буст по локации не нужен. location_index
     (результат build_location_index) не зависит от конкретного чанка
-    запросов, поэтому передаётся как есть, без нарезки по чанкам."""
+    запросов, поэтому передаётся как есть, без нарезки по чанкам.
+
+    fuzzy_index -- обученный src.fuzzy.FuzzyIndex (можно не передавать,
+    тогда alpha_fuzzy=0.0 и нечёткое сопоставление не используется).
+    fuzzy_query_texts -- список "сырых" (см. build_fuzzy_query_text)
+    текстов запроса, выровненный построчно с query_texts (тот же
+    порядок и длина), но НЕ то же самое, что query_texts -- у BM25 текст
+    взвешен повторением токенов, а для символьных n-грамм это не нужно
+    (TF-IDF сам нормирует частоты)."""
     results = []
     for start in range(0, len(query_texts), chunk_size):
         chunk_texts = query_texts[start:start + chunk_size]
@@ -249,13 +274,21 @@ def rank_all(
             if search_location_redirect_targets is not None else None
         )
         scores_chunk = next(bm25_index.score_chunked(chunk_texts, chunk_size=len(chunk_texts)))
+        fuzzy_scores_chunk = None
+        if fuzzy_index is not None and alpha_fuzzy > 0:
+            chunk_fuzzy_texts = fuzzy_query_texts[start:start + chunk_size]
+            fuzzy_scores_chunk = next(
+                fuzzy_index.score_chunked(chunk_fuzzy_texts, chunk_size=len(chunk_fuzzy_texts))
+            ).tocsr()
         results.extend(boosted_top_k(
             chunk_qtext, scores_chunk, item_ids_sorted, item_microcat,
             qtext_to_items, qtext_to_microcat,
             location_index=location_index,
             item_location=item_location, search_location_list=chunk_loc,
             search_location_redirect_targets=chunk_loc_targets,
+            fuzzy_scores_csr=fuzzy_scores_chunk,
             k=k, alpha_microcat=alpha_microcat, alpha_location=alpha_location,
+            alpha_fuzzy=alpha_fuzzy,
             memo_bonus=memo_bonus,
         ))
     return results
@@ -272,9 +305,11 @@ def boosted_top_k(
     search_location_list=None,
     search_location_redirect_targets=None,
     location_index=None,
+    fuzzy_scores_csr=None,
     k=50,
     alpha_microcat=0.5,
     alpha_location=0.0,
+    alpha_fuzzy=0.0,
     memo_bonus=1e6,
 ):
     """
@@ -313,6 +348,14 @@ def boosted_top_k(
                                 модуля). Если не передан, буст по локации
                                 только переранжирует то, что и так нашёл
                                 BM25 -- прежнее, более узкое поведение.
+      fuzzy_scores_csr        -- разреженная CSR-матрица (n_queries x
+                                n_items) косинусных близостей от
+                                src.fuzzy.FuzzyIndex.score_chunked, той же
+                                формы и с тем же порядком строк, что и
+                                bm25_scores_csr (обе строятся по одному и
+                                тому же чанку запросов). Можно не
+                                передавать, тогда alpha_fuzzy=0.0 и
+                                нечёткое сопоставление не используется.
     """
     results = []
     n = bm25_scores_csr.shape[0]
@@ -406,6 +449,24 @@ def boosted_top_k(
                 boost_mask = cand_microcats == mc
                 if boost_mask.any():
                     vals[boost_mask] += alpha_microcat * p * max_v
+
+        # --- Нечёткое сопоставление по символьным n-граммам (см. п.2
+        # докстринга модуля и src/fuzzy.py): небольшая добавка к скору
+        # пропорционально косинусной близости по символьным n-граммам.
+        # Особенно важно для кандидатов, добавленных выше через
+        # расширение по локации с нулевым BM25-скором -- fuzzy-скор для
+        # них может быть единственным текстовым сигналом вообще. ---
+        if alpha_fuzzy > 0 and fuzzy_scores_csr is not None and len(cols):
+            frow_start = fuzzy_scores_csr.indptr[i]
+            frow_end = fuzzy_scores_csr.indptr[i + 1]
+            fuzzy_cols = fuzzy_scores_csr.indices[frow_start:frow_end]
+            fuzzy_vals = fuzzy_scores_csr.data[frow_start:frow_end]
+            if len(fuzzy_cols):
+                col_to_pos = {c: j for j, c in enumerate(cols)}
+                for fc, fv in zip(fuzzy_cols, fuzzy_vals):
+                    j = col_to_pos.get(fc)
+                    if j is not None:
+                        vals[j] += alpha_fuzzy * fv * max_v
 
         # --- Меморизация точного исторического объявления (в финальном
         # пайплайне отключена -- см. докстринг модуля; qtext_to_items
