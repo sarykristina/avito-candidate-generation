@@ -18,8 +18,8 @@ re-rank. Optimized for **Recall@50**.
 - **No external APIs, no downloaded models.** Everything runs locally
   with pandas/numpy/scipy/scikit-learn.
 - **Offline validation** (held out from `train.parquet`, see below):
-  **Recall@50 ≈ 0.812** (up from 0.19 for text-only BM25).
-- **Real benchmark history**, tracked across four submitted iterations of
+  **Recall@50 ≈ 0.823** (up from 0.19 for text-only BM25).
+- **Real benchmark history**, tracked across five submitted iterations of
   this pipeline as the location signal was progressively refined (see
   "Errors found" for the investigation behind each step):
 
@@ -28,12 +28,18 @@ re-rank. Optimized for **Recall@50**.
   | 1. Raw location-match boost only | 0.751 | 0.7182 |
   | 2. + location redirect (unweighted, top-1 hub) | 0.800 | 0.7408 |
   | 3. + redirect weighted by confidence | 0.804 | 0.7510 |
-  | 4. + top-5 redirect hubs instead of top-1 (current) | 0.812 | *pending* |
+  | 4. + top-5 redirect hubs instead of top-1 | 0.812 | 0.7539 |
+  | 5. + guaranteed candidate expansion by location (current) | 0.823 | *pending* |
 
   Confidence weighting (iteration 3) delivered a **larger** real-world
   gain than its offline estimate predicted (+0.0102 real vs. +0.0037
-  offline) — a reassuring sign that this direction generalizes at least
-  as well as the offline harness suggests, not worse.
+  offline). Iteration 4 (top-5 hubs), on the other hand, delivered a much
+  **smaller** real gain than offline suggested (+0.0029 real vs. +0.008
+  offline) — diminishing returns from further tuning of the *same*
+  location-matching mechanism, which is what prompted iteration 5: a
+  structurally different fix (expanding *which items can become
+  candidates at all*, not just re-tuning how already-found candidates are
+  boosted) rather than another refinement of the same knob.
 - Reproduce with:
   ```bash
   pip install -r requirements.txt
@@ -202,8 +208,52 @@ steadily with `top_n`: **0.786 (n=1) → 0.792 (n=2) → 0.794 (n=4) → 0.794
 (n=5)**, plateauing right around n=5 (n=6 was marginally *worse* —
 0.7942 vs 0.7942 rounds the same but the 6th-ranked target is already
 essentially noise for most locations). `top_n=5` is used in the final
-pipeline. This (offline) submission has not yet been scored on the real
-benchmark as of this README revision.
+pipeline. Resubmitting with this change gave a much smaller real-world
+gain than the offline estimate predicted (0.7510 → 0.7539 real, vs. 0.804
+→ 0.812 offline) — a clear sign of diminishing returns from further
+tuning of *how strongly* to trust location matches, which is what led to
+the next, structurally different fix below.
+
+### 0e. Guaranteeing candidates by location, not just re-ranking them
+
+Every location signal so far (§0–§0d) only **re-ranks** items that BM25
+already found through some lexical overlap with the query — it can move
+a same-location item to the top of the list, but it can never *introduce*
+an item that shares zero words with the query text in the first place.
+I checked directly how often that blind spot actually bites: **3.1% of
+all relevant items** (in the offline validation) sit in exactly the right
+location (raw or one of its top-5 redirect targets) but share **not a
+single word** with the query — BM25 never even considers them, no matter
+how much location boost is on offer.
+
+`src/ranking.py::build_location_index` builds a `location_id → item
+positions` lookup once, and `boosted_top_k` uses it to **unconditionally
+add every item in the query's eligible locations to the candidate set**
+before scoring — with a BM25 score of exactly 0 if the text never
+matched, so the location (and microcategory) boosts become their only
+source of score. I tested capping this at various location sizes, to
+avoid pointlessly enumerating thousands of listings for a city like
+Moscow on every query, and found Recall@50 kept improving all the way up
+to *no cap at all*:
+
+| Max items added per location | Recall@50 |
+|---|---|
+| 20 | 0.8121 |
+| 100 | 0.8138 |
+| 500 | 0.8162 |
+| 2,000 | 0.8202 |
+| 10,000 | 0.8228 |
+| **no cap (final)** | **0.8234** |
+
+This makes sense once you see it: extra candidates can only ever compete
+for the bottom of the top-50 list (real BM25 matches, which already carry
+the full location boost too, are never displaced), so there is no
+mechanism by which adding more of them can *hurt* — only a computational
+cost for very large locations, which turned out to be manageable (the
+full benchmark run still finishes in about two minutes). This was the
+single biggest offline jump since the original location boost itself
+(§0), which is exactly what you'd expect from fixing a structural blind
+spot rather than tuning a threshold inside an already-working mechanism.
 
 ### 1. Text preprocessing (`src/text_utils.py`)
 
@@ -273,7 +323,7 @@ without ever touching benchmark labels (there are none to touch):
   **Before the location boost existed, this signal consistently *hurt***
   offline recall (0.182 → 0.176 as its weight increased). **After adding
   the location boost, the same signal *helps*** (a further +0.02
-  Recall@50 at the best weight — see "Errors found" #4 for why the same
+  Recall@50 at the best weight — see "Errors found" #6 for why the same
   prior flips from harmful to helpful depending on what else is already
   in the ranking; this was the most interesting methodological lesson in
   this project).
@@ -302,10 +352,11 @@ without ever touching benchmark labels (there are none to touch):
 
 ### 4. Final ranking
 
-For each query: BM25 score over the full item corpus → add the
-location-match boost (full strength for a raw match, confidence-weighted
-for each of up to 5 redirect-target matches) → add the microcategory-match
-boost → take the top 50 by score.
+For each query: BM25 score over the full item corpus → guarantee every
+item in the query's eligible locations is a candidate (§0e, even with a
+zero text score) → add the location-match boost (full strength for a raw
+match, confidence-weighted for each of up to 5 redirect-target matches)
+→ add the microcategory-match boost → take the top 50 by score.
 
 ## How I validated before submitting
 
@@ -345,13 +396,15 @@ Full progression on the offline EVAL set (all numbers reproducible via
 | + location redirect, top-1 target, unweighted | 0.7816 |
 | + location redirect, top-1 target, weighted by confidence | 0.7862 |
 | + location redirect, top-5 targets, weighted by confidence | 0.7942 |
-| + microcategory prior (`alpha_microcat=0.2`) | **0.8119** (final) |
+| + microcategory prior (`alpha_microcat=0.2`) | 0.8119 |
 | + historical memorization (query text only) on top of the above | 0.8113 (no gain, dropped) |
+| + guaranteed candidate expansion by location (§0e) | **0.8234** (final) |
 
 Real benchmark scores tracked across the actual submitted iterations of
 this pipeline (see TL;DR table too): **0.7182** (raw location match
 only) → **0.7408** (+ unweighted top-1 redirect) → **0.7510**
-(+ confidence weighting) → *pending* (+ top-5 redirect targets, this
+(+ confidence weighting) → **0.7539** (+ top-5 redirect targets) →
+*pending* (+ guaranteed location-based candidate expansion, this
 version).
 
 ## Errors found during analysis, and what I did about them
@@ -370,10 +423,12 @@ version).
    redirect described in "Method" §0b. Resubmitting confirmed the fix
    generalized: the real score rose to 0.7408. The next round (confidence
    weighting, §0c) generalized even better than its offline estimate
-   predicted, which is the strongest evidence so far that this whole
-   direction (location, not just text) was the right thing to keep
-   pushing on, rather than something narrowly overfit to the offline
-   harness.
+   predicted, but the round after that (top-5 redirect targets, §0d)
+   generalized *worse* than predicted (+0.0029 real vs +0.008 offline) —
+   a sign that simply tuning the same location-matching mechanism harder
+   was running out of road. That observation directly motivated §0e
+   (guaranteed candidate expansion), a structurally different fix rather
+   than another turn of the same knob.
 
 2. **Text-only BM25 was quietly leaving the single biggest signal on the
    table in the first place.** Recall@50 of 0.19 looked low for how
@@ -382,11 +437,24 @@ version).
    did: 83.1% of historically-chosen items share their `item_location_id`
    with the query's `search_location_id`. **Fix**: added the location-match
    boost described in "Method" §0 — together with its redirect,
-   confidence-weighting and top-N refinements, this is responsible for
-   essentially all of the improvement in this solution over plain text
-   search.
+   confidence-weighting, top-N and candidate-expansion refinements, this
+   is responsible for essentially all of the improvement in this solution
+   over plain text search.
 
-3. **Memory blow-up from template boilerplate** (`item_infm_params_text`
+3. **Even with location boosting, BM25 physically couldn't surface items
+   with zero lexical overlap with the query.** All the boosts through
+   §0d only re-rank items BM25 already found by shared vocabulary — an
+   item that happens to share no words at all with the query text can
+   never enter the candidate set, no matter what boost it would get.
+   Direct measurement on the offline set: **3.1% of all relevant items**
+   sit in exactly the right location but have zero word overlap with the
+   query. **Fix**: `build_location_index` (§0e) unconditionally adds
+   every item in a query's eligible locations to the candidate pool, with
+   a zero-text-score baseline if BM25 never found it — this was the
+   single largest offline jump since the original location boost, and
+   directly targets a structural gap rather than tuning an existing one.
+
+4. **Memory blow-up from template boilerplate** (`item_infm_params_text`
    is a fixed form with labels like "Вид услуги", "Место оказания услуг",
    weekday names — present in 95-100% of items). Left unfiltered, this
    makes the query×item score matrix structurally dense (confirmed
@@ -395,7 +463,7 @@ version).
    scoring (`BM25Index.score_chunked`) so memory is bounded by chunk size
    regardless of density.
 
-4. **The memorization prior made recall *worse*, not better**, when first
+5. **The memorization prior made recall *worse*, not better**, when first
    added unconditionally (0.182 → 0.150). Root cause: exact query text is
    a much coarser key than a real query instance — generic one-word
    queries like *"маникюр"* (5,474 distinct historical items),
@@ -410,7 +478,7 @@ version).
    about this kind of prior. Conditioning the same idea on (text, location)
    together instead of text alone was tried too — see §3.)
 
-5. **The microcategory prior flipped from harmful to helpful once
+6. **The microcategory prior flipped from harmful to helpful once
    location was added — the most important methodological lesson here.**
    Without the location boost, this prior consistently hurt recall
    (0.182 → 0.176 as its weight increased); with the location boost
@@ -427,7 +495,7 @@ version).
    sweep after each change rather than trusting an earlier isolated
    verdict.
 
-6. **`search_category`** is 114 for 91% of both train and benchmark
+7. **`search_category`** is 114 for 91% of both train and benchmark
    queries — checked and explicitly not used as a signal, to avoid the
    false impression that category filtering was doing useful work.
 
