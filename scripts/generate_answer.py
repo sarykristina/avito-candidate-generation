@@ -30,15 +30,17 @@ README.ru.md):
          бенчмарка нет вообще ни одного объявления с тем же
          search_location_id в корпусе (маленький город/район без своих
          исполнителей) -- для них прямое совпадение не срабатывает.
-         `build_location_redirect` учит по train.parquet, в какой
-         "хаб" (обычно ближайший крупный город) реально ведут такие
-         поиски, и буст проверяет совпадение с ЛЮБОЙ из двух локаций.
-         Уверенность редиректа (какая доля поисков из этой локации
-         реально привела к этому хабу) варьируется от локации к
-         локации -- буст по редиректу масштабируется этой уверенностью,
-         а не применяется всегда в полную силу, как прямое совпадение
-         (см. src/ranking.py: наивное полносильное применение оказалось
-         хуже взвешенного на офлайн-валидации).
+         `build_location_redirect` учит по train.parquet, в какие до
+         5 "хабов" (обычно соседние крупные города) реально ведут такие
+         поиски, и буст проверяет совпадение с любым из них -- не только
+         с самым частым (top-1), т.к. у многих локаций поиски делятся
+         между несколькими соседними хабами почти поровну. Каждый
+         адресат взвешен своей уверенностью (какая доля поисков из этой
+         локации реально к нему привела) -- буст по редиректу
+         масштабируется этой уверенностью, а не применяется всегда в
+         полную силу, как прямое совпадение (см. src/ranking.py: и
+         наивное полносильное применение, и top-1-вместо-top-5 оказались
+         хуже на офлайн-валидации).
        - буст по микрокатегории, которую пользователи исторически
          выбирали для этого текста запроса -- полезен именно вместе с
          бустом по локации (см. src/ranking.py).
@@ -55,6 +57,7 @@ README.ru.md):
 
 import sys
 import time
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, ".")
@@ -128,24 +131,18 @@ def main():
     qtext_to_microcat = train.groupby("_qtext_norm")["item_microcat_id"].agg(
         lambda x: x.value_counts(normalize=True).to_dict()
     )
-    location_redirect, location_redirect_confidence = build_location_redirect(
-        train["search_location_id"], train["item_location_id"]
+    location_redirect = build_location_redirect(
+        train["search_location_id"], train["item_location_id"], top_n=5
     )
     # Если для какого-то search_location_id из бенчмарка вообще не было
     # строк в train.parquet (не должно случаться -- все 58 "проблемных"
     # локаций бенчмарка встретились в train.parquet, см. README.md), на
-    # всякий случай откатываемся на саму локацию поиска (тогда буст по
-    # редиректу просто выродится в обычное прямое совпадение) и на
-    # уверенность 1.0 (не занижаем полносильный буст прямого совпадения).
-    search_location_redirect_list = (
+    # всякий случай подставляем пустой список целей (тогда буст сработает
+    # только по прямому совпадению, если оно есть).
+    search_location_redirect_targets = (
         queries["search_location_id"].map(location_redirect)
-        .fillna(queries["search_location_id"])
-        .to_numpy()
-    )
-    search_location_redirect_confidence = (
-        queries["search_location_id"].map(location_redirect_confidence)
-        .fillna(1.0)
-        .to_numpy()
+        .apply(lambda v: v if isinstance(v, list) else [])
+        .tolist()
     )
     # Меморизация точных объявлений (qtext_to_items) в этом пайплайне не
     # используется -- см. докстринг модуля и README.md: после добавления
@@ -157,8 +154,7 @@ def main():
         query_texts, qtext_norm_list, bm25, item_ids, item_microcat,
         qtext_to_items, qtext_to_microcat,
         item_location=item_location, search_location_list=search_location_list,
-        search_location_redirect_list=search_location_redirect_list,
-        search_location_redirect_confidence=search_location_redirect_confidence,
+        search_location_redirect_targets=search_location_redirect_targets,
         k=K, alpha_microcat=ALPHA_MICROCAT, alpha_location=ALPHA_LOCATION,
         chunk_size=CHUNK,
     )
@@ -187,8 +183,10 @@ def main():
         for i, r in enumerate(ranked):
             if len(r) == 0:
                 cat = queries["search_category"].iloc[i]
-                loc_mask = (item_location == search_location_list[i]) | \
-                           (item_location == search_location_redirect_list[i])
+                target_locs = {search_location_list[i]} | {
+                    loc for loc, _ in search_location_redirect_targets[i]
+                }
+                loc_mask = np.isin(item_location, list(target_locs))
                 same_loc = items[(items["item_category_id"] == cat) & loc_mask]
                 if len(same_loc):
                     ranked[i] = same_loc.sort_values(
