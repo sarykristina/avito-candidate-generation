@@ -18,8 +18,12 @@ re-rank. Optimized for **Recall@50**.
 - **No external APIs, no downloaded models.** Everything runs locally
   with pandas/numpy/scipy/scikit-learn.
 - **Offline validation** (held out from `train.parquet`, see below):
-  **Recall@50 ≈ 0.751** (up from 0.185 for text-only BM25 — the location
-  signal alone is responsible for almost all of that gap).
+  **Recall@50 ≈ 0.80** (up from 0.19 for text-only BM25). On the real
+  benchmark, an earlier version of this pipeline (location boost only,
+  without the location-redirect refinement described below) scored
+  **0.7182** — a reasonable, expected gap from the 0.751 that version
+  measured offline, given the offline harness is itself an approximation
+  built from a held-out slice of `train.parquet`, not the real benchmark.
 - Reproduce with:
   ```bash
   pip install -r requirements.txt
@@ -88,8 +92,8 @@ irrelevant listings.
 
 Adding a location-match boost to the ranking score
 (`src/ranking.py::boosted_top_k`, `alpha_location` parameter) raised
-offline Recall@50 from **0.184 → 0.735** — by far the largest effect of
-any change in this solution, an order of magnitude bigger than every
+offline Recall@50 from **0.19 → 0.75** — by far the largest effect of any
+change in this solution, an order of magnitude bigger than every
 text-weighting or prior-tuning experiment combined. I did not use this
 signal in my first submission and only found it once I went back to
 question why text-only BM25 was underperforming so much relative to how
@@ -99,7 +103,7 @@ even features that look like they "belong" to the ranking stage.
 Implementation: a soft additive boost, not a hard filter — items outside
 the searcher's location are never excluded, only ranked lower, so a
 query with no local listings at all still falls back gracefully to the
-best texts match anywhere. The boost is scaled by that query's own
+best text match anywhere. The boost is scaled by that query's own
 maximum BM25 score (`alpha_location * max_score`), so a single
 `alpha_location` value works consistently across queries with very
 different score magnitudes. Recall@50 plateaus already at
@@ -108,6 +112,44 @@ different score magnitudes. Recall@50 plateaus already at
 guarantees every same-location candidate outranks every other-location
 candidate for that query, so there's nothing left to gain by increasing
 it further. I use the smallest value that reaches this plateau.
+
+### 0b. Location redirect — the second-biggest finding
+
+I first submitted the pipeline with only the raw location-match boost
+above, and it scored **0.7182** on the real benchmark (vs 0.751 offline —
+see "Errors found" #1 for the follow-up investigation this gap
+triggered). Digging into *why* the real score fell short of the offline
+estimate, I found: **17.4% of benchmark queries (427 of 2452) have a
+`search_location_id` for which `benchmark_items.parquet` contains *zero*
+items** with that same `item_location_id`. For those queries the
+location boost above simply never fires — there's nothing to match — and
+ranking silently falls back to plain text+category, which is exactly the
+~0.19 baseline regime.
+
+These aren't random IDs: they're real, frequently-searched small
+towns/districts that apparently have no service providers of their own
+listed on Avito. Checking `train.parquet`, all 58 distinct
+`search_location_id`s behind these 427 queries show up there thousands
+of times as *search* locations, and each one has an overwhelmingly
+dominant *item* location that searches from it actually resolve to
+(70–100% of the time, in the examples I inspected) — almost certainly the
+nearest city or hub that actually serves that area. This isn't specific
+to the problem locations either: across **all** distinct
+`search_location_id` values in `train.parquet`, 44% have a most-common
+resolved `item_location_id` that differs from the search location itself
+— it's just that for well-served city-level locations that dominant
+target is usually the city itself, so it's invisible unless you check.
+
+`src/ranking.py::build_location_redirect` learns this mapping
+(`search_location_id → most historically common item_location_id`)
+directly from `train.parquet`, and the location boost then matches
+against **either** the raw search location **or** its redirect (a soft
+union, not a replacement — for the 82.6% of queries with normal,
+well-served locations this is a no-op, since the redirect target usually
+*is* the search location itself). This raised offline Recall@50 by
+another **+0.031** on top of the plain location boost (0.751 → 0.782 at
+the same microcategory weight, on a larger/more stable 5,000-query
+offline sample — see the table below).
 
 ### 1. Text preprocessing (`src/text_utils.py`)
 
@@ -135,7 +177,7 @@ before counting — a cheap stand-in for per-field BM25 weighting. Grid
 search on the offline validation set (`scripts/run_validation.py`) over
 title/params/description weight triples found **5 / 3 / 1** to be the
 smallest weighting that reaches the recall plateau (numbers below are
-text-only BM25, *before* the location boost):
+text-only BM25, *before* any location boost):
 
 | weights (title/params/description) | Recall@50 |
 |---|---|
@@ -168,25 +210,24 @@ query × item product.
 
 ### 3. Historical priors from `train.parquet` (`src/ranking.py`)
 
-Two more signals were tried, learned from query→item pairs in
-`train.parquet` and layered on top of BM25 + the location boost, without
-ever touching benchmark labels (there are none to touch):
+Beyond location, two more signals were tried, learned from query→item
+pairs in `train.parquet` and layered on top of BM25 + the location boost,
+without ever touching benchmark labels (there are none to touch):
 
 - **Microcategory prior**: boost items whose `item_microcat_id` matches
   the microcategory historically chosen for the same query text.
   **Before the location boost existed, this signal consistently *hurt***
   offline recall (0.182 → 0.176 as its weight increased). **After adding
-  the location boost, the same signal *helps*** (+0.016 Recall@50: 0.735
-  → 0.751 at the best weight). See "Errors found" #3 for why the same
+  the location boost, the same signal *helps*** (a further +0.02
+  Recall@50 at the best weight — see "Errors found" #4 for why the same
   prior flips from harmful to helpful depending on what else is already
-  in the ranking — this was the most interesting methodological lesson
-  in this project.
+  in the ranking; this was the most interesting methodological lesson in
+  this project).
 - **Historical item memorization**: if the exact same (normalized) query
   text previously led to a specific `item_id` still in the corpus, force
-  it into the candidates. Useful on top of text-only BM25 (+0.001–0.0013
-  Recall@50), but became redundant once location was added (0.7347
-  without it vs 0.7344 with it — a difference within noise, consistently
-  slightly negative). Likely reason: the same query text leads to
+  it into the candidates. Useful on top of text-only BM25, but became
+  redundant (a small, consistently negative effect, within noise) once
+  location was added. Likely reason: the same query text leads to
   *different* items in different cities, so a single "nationally most
   common" historical answer is no longer useful once location is modeled
   directly. **Not used in the final pipeline** — the function
@@ -196,8 +237,8 @@ ever touching benchmark labels (there are none to touch):
 ### 4. Final ranking
 
 For each query: BM25 score over the full item corpus → add the
-location-match boost → add the microcategory-match boost → take the top
-50 by score.
+location-match boost (raw location OR its redirect) → add the
+microcategory-match boost → take the top 50 by score.
 
 ## How I validated before submitting
 
@@ -209,8 +250,10 @@ rows on the full query feature set (`search_query`,
 relevant set (mean 1.32 relevant items/query, matching the task's "usually
 one or two" description).
 
-I split query instances **90/10 into FIT/EVAL** (2,000 EVAL instances,
-seeded). FIT plays the role of the historical query log (fits BM25 +
+I split query instances into **FIT/EVAL** (5,000 EVAL instances, seeded
+— increased from an initial 2,000 once it became clear that some
+hyperparameter comparisons were within the noise floor of the smaller
+sample). FIT plays the role of the historical query log (fits BM25 +
 builds the priors); EVAL plays the role of held-out benchmark queries.
 The item corpus for scoring is every unique item in the *whole* of
 train.parquet (344,825 items) — knowing the corpus isn't a label leak,
@@ -223,29 +266,52 @@ identical to what a random split of train.parquet itself reproduces — so
 the offline number should transfer reasonably well to the real
 benchmark score.
 
-Full progression on the offline EVAL set (all numbers from
+Full progression on the offline EVAL set (all numbers reproducible via
 `scripts/run_validation.py`):
 
 | Configuration | Recall@50 |
 |---|---|
-| Text-only BM25 (5/3/1 weights) | 0.1842 |
-| + location boost (`alpha_location=1.0`) | 0.7347 |
-| + microcategory prior (`alpha_microcat=0.2`) | **0.7510** (final) |
-| + historical memorization on top of the above | 0.7500 (no gain, dropped) |
+| Text-only BM25 (5/3/1 weights) | 0.1896 |
+| + location boost, raw match only (`alpha_location=1.0`) | 0.7507 |
+| + location redirect (union with raw match) | 0.7816 |
+| + microcategory prior (`alpha_microcat=0.2`) | **0.8003** (final) |
+| + historical memorization on top of the above | 0.7997 (no gain, dropped) |
+
+The real benchmark score for the version *without* the location redirect
+(row 2 above, 0.7507 offline) was **0.7182** — the redirect and the
+larger/more stable validation sample (both added after that submission,
+see "Errors found" #1) are expected to close most of that ~0.03 gap,
+though the exact number on the real benchmark for the *current* pipeline
+is of course only known once it's actually submitted.
 
 ## Errors found during analysis, and what I did about them
 
-1. **Text-only BM25 was quietly leaving the single biggest signal on the
-   table.** Recall@50 of 0.18 looked low for how specific most queries
-   are ("баня на дровах", "монтаж видеодомофонов"), which prompted a
-   direct check of whether location explains the gap. It did: 83.1% of
-   historically-chosen items share their `item_location_id` with the
-   query's `search_location_id`. **Fix**: added a location-match boost
-   (see "Method" §0) — this single change is responsible for ~85% of the
-   total improvement in this solution (0.184 → 0.735 out of a final
-   0.751).
+1. **A real-benchmark score below the offline estimate led to finding a
+   second major signal.** The first submitted version of this pipeline
+   (text BM25 + raw location-match boost + microcategory prior, no
+   redirect) scored 0.7182 on the real benchmark against an offline
+   estimate of 0.751 — a believable but real generalization gap. Rather
+   than accept it, I checked directly whether the benchmark's smaller,
+   189k-item corpus behaves differently from the 345k-item train-based
+   offline corpus with respect to location coverage, and found it does:
+   **17.4% of benchmark queries have zero items in `benchmark_items.parquet`
+   sharing their exact `search_location_id`** (vs. an implicitly higher
+   coverage rate in the larger offline corpus). **Fix**: the location
+   redirect described in "Method" §0b, which recovers this gap by
+   learning where these under-served locations' searches actually resolve
+   to, historically.
 
-2. **Memory blow-up from template boilerplate** (`item_infm_params_text`
+2. **Text-only BM25 was quietly leaving the single biggest signal on the
+   table in the first place.** Recall@50 of 0.19 looked low for how
+   specific most queries are ("баня на дровах", "монтаж видеодомофонов"),
+   which prompted a direct check of whether location explains the gap. It
+   did: 83.1% of historically-chosen items share their `item_location_id`
+   with the query's `search_location_id`. **Fix**: added the location-match
+   boost described in "Method" §0 — together with its redirect refinement,
+   this is responsible for essentially all of the improvement in this
+   solution over plain text search.
+
+3. **Memory blow-up from template boilerplate** (`item_infm_params_text`
    is a fixed form with labels like "Вид услуги", "Место оказания услуг",
    weekday names — present in 95-100% of items). Left unfiltered, this
    makes the query×item score matrix structurally dense (confirmed
@@ -254,7 +320,7 @@ Full progression on the offline EVAL set (all numbers from
    scoring (`BM25Index.score_chunked`) so memory is bounded by chunk size
    regardless of density.
 
-3. **The memorization prior made recall *worse*, not better**, when first
+4. **The memorization prior made recall *worse*, not better**, when first
    added unconditionally (0.182 → 0.150). Root cause: exact query text is
    a much coarser key than a real query instance — generic one-word
    queries like *"маникюр"* (5,474 distinct historical items),
@@ -268,34 +334,39 @@ Full progression on the offline EVAL set (all numbers from
    see §3 of "Method" — but the fix itself is still the right lesson
    about this kind of prior.)
 
-4. **The microcategory prior flipped from harmful to helpful once
+5. **The microcategory prior flipped from harmful to helpful once
    location was added — the most important methodological lesson here.**
    Without the location boost, this prior consistently hurt recall
    (0.182 → 0.176 as its weight increased); with the location boost
-   already in place, the *same* prior *helps* (0.735 → 0.751). My
-   reading: without location, the candidate pool for a typical query is
-   dominated by textually-similar listings from all over the country, and
-   a category prior just adds more noise to an already-noisy pool. With
-   location narrowing the pool down to one city first, the remaining
-   ambiguity (e.g. two different microcategories using similar wording)
-   is exactly what the category prior is good at resolving. **Takeaway
-   I'm keeping in mind**: a signal that looks harmful in isolation isn't
-   necessarily a bad signal — it can be evaluated only relative to what
-   else is already in the ranking, so I re-ran the full sweep after each
-   change rather than trusting an earlier isolated verdict.
+   already in place, the *same* prior *helps*. My reading: without
+   location, the candidate pool for a typical query is dominated by
+   textually-similar listings from all over the country, and a category
+   prior just adds more noise to an already-noisy pool. With location
+   narrowing the pool down to one city (or its serving hub) first, the
+   remaining ambiguity (e.g. two different microcategories using similar
+   wording) is exactly what the category prior is good at resolving.
+   **Takeaway I'm keeping in mind**: a signal that looks harmful in
+   isolation isn't necessarily a bad signal — it can be evaluated only
+   relative to what else is already in the ranking, so I re-ran the full
+   sweep after each change rather than trusting an earlier isolated
+   verdict.
 
-5. **`search_category`** is 114 for 91% of both train and benchmark
+6. **`search_category`** is 114 for 91% of both train and benchmark
    queries — checked and explicitly not used as a signal, to avoid the
    false impression that category filtering was doing useful work.
 
 ## What I would try next with more time
 
-- **Graceful location fallback**: right now, a query with zero same-city
-  listings falls back to nationwide BM25 ranking. A softer version — e.g.
-  a distance-based boost using `item_latitude`/`item_longitude` instead
-  of exact `location_id` match, or falling back to a wider region before
-  the whole country — could recover some of the ~17% of cases where the
-  true answer isn't in the exact same `location_id`.
+- **A softer, distance-based fallback** for the residual cases the
+  location redirect doesn't fully resolve (e.g. using
+  `item_latitude`/`item_longitude`). I explored this directly: for about
+  36% of items, `item_location_id` turns out to represent a broad region
+  rather than a precise city (coordinate std. dev. within a single
+  `location_id` can be hundreds of km), so naively averaging coordinates
+  per `location_id` to get a "center point" would be misleading for those
+  — a real implementation would need to detect city-level vs
+  region-level location IDs first, which felt like more scope than time
+  allowed here.
 - **Field-specific BM25** (separate IDF per field) instead of the
   token-repetition weighting trick — the trick is a reasonable
   approximation but a true multi-field BM25F would let title/description
