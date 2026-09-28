@@ -18,12 +18,23 @@ re-rank. Optimized for **Recall@50**.
 - **No external APIs, no downloaded models.** Everything runs locally
   with pandas/numpy/scipy/scikit-learn.
 - **Offline validation** (held out from `train.parquet`, see below):
-  **Recall@50 ≈ 0.80** (up from 0.19 for text-only BM25). On the real
-  benchmark, an earlier version of this pipeline (location boost only,
-  without the location-redirect refinement described below) scored
-  **0.7182** — a reasonable, expected gap from the 0.751 that version
-  measured offline, given the offline harness is itself an approximation
-  built from a held-out slice of `train.parquet`, not the real benchmark.
+  **Recall@50 ≈ 0.804** (up from 0.19 for text-only BM25).
+- **Real benchmark history**, tracked across three submitted iterations
+  of this pipeline as the location signal was refined (see "Errors found"
+  for the investigation behind each step):
+
+  | Iteration | Offline Recall@50 | Real benchmark Recall@50 |
+  |---|---|---|
+  | 1. Raw location-match boost only | 0.751 | 0.7182 |
+  | 2. + location redirect (unweighted) | 0.800 | 0.7408 |
+  | 3. + redirect weighted by confidence (current) | 0.804 | *pending* |
+
+  The offline→real gap shrank a lot between iterations 1 and 2 (0.033 →
+  0.059 in absolute terms actually widened slightly, but the *real* score
+  itself improved by +0.023, tracking the +0.05 offline improvement
+  reasonably well — see "Errors found" #1 for why the gap isn't expected
+  to hit zero even with a perfect signal, since the offline harness and
+  the real benchmark are different samples by construction).
 - Reproduce with:
   ```bash
   pip install -r requirements.txt
@@ -147,9 +158,36 @@ against **either** the raw search location **or** its redirect (a soft
 union, not a replacement — for the 82.6% of queries with normal,
 well-served locations this is a no-op, since the redirect target usually
 *is* the search location itself). This raised offline Recall@50 by
-another **+0.031** on top of the plain location boost (0.751 → 0.782 at
-the same microcategory weight, on a larger/more stable 5,000-query
-offline sample — see the table below).
+another **+0.031** on top of the plain location boost, and the real
+benchmark score confirmed the improvement was real, not offline-only:
+**0.7182 → 0.7408** (+0.023) after resubmitting with this fix.
+
+### 0c. Weighting the redirect by its own confidence
+
+After the redirect above, I confirmed 100% of benchmark queries now have
+*some* location-boosted candidate (raw or redirect). But the redirect
+"mode" isn't equally trustworthy everywhere: across all `search_location_id`
+values, the share of historical searches that actually went to the
+dominant target ranges from as low as ~5% to 100% — for some locations
+it's a confident, near-certain call, for others it's barely better than
+a coin flip between two similarly-likely hubs. The pipeline was treating
+all of these identically, boosting a 50%-confidence guess exactly as hard
+as an 83%-confidence direct match.
+
+`build_location_redirect` now also returns this confidence (the share of
+historical searches from that location that resolved to the returned
+mode), and the redirect-only boost (items that match the redirect but not
+the raw search location) is scaled by it:
+`confidence * alpha_location * max_score`, while a genuine raw-location
+match still always gets the full, unscaled boost (that one is a fact
+about the item, not a historical guess). I also tried a hard-threshold
+version (only apply the redirect boost above some confidence cutoff) —
+it was **worse** than smooth weighting at every threshold tried (0.783 at
+a 0.8 cutoff vs. 0.804 weighted): a cutoff throws away the boost entirely
+for lower-confidence locations, and even a mediocre geographic guess
+clearly beats no geographic signal at all. Weighting by confidence gave
+another **+0.004** Recall@50 offline on top of the plain (unweighted)
+redirect.
 
 ### 1. Text preprocessing (`src/text_utils.py`)
 
@@ -223,22 +261,36 @@ without ever touching benchmark labels (there are none to touch):
   prior flips from harmful to helpful depending on what else is already
   in the ranking; this was the most interesting methodological lesson in
   this project).
-- **Historical item memorization**: if the exact same (normalized) query
-  text previously led to a specific `item_id` still in the corpus, force
-  it into the candidates. Useful on top of text-only BM25, but became
-  redundant (a small, consistently negative effect, within noise) once
-  location was added. Likely reason: the same query text leads to
-  *different* items in different cities, so a single "nationally most
-  common" historical answer is no longer useful once location is modeled
-  directly. **Not used in the final pipeline** — the function
-  (`build_memo_prior`) is kept working and is still exercised in
-  `scripts/run_validation.py` so this comparison stays reproducible.
+- **Historical item memorization**, two variants tried:
+  - Keyed on query text alone: useful on top of text-only BM25, but
+    became redundant (a small, consistently negative effect, within
+    noise) once location was added — the same query text leads to
+    *different* items in different cities, so a single "nationally most
+    common" historical answer stops being useful once location is
+    modeled directly.
+  - Keyed on (query text, `search_location_id`) together — much more
+    precise (81% of such pairs in `train.parquet` have exactly one
+    historical answer, vs. 60% for text alone), and it did help slightly
+    offline (+0.001 to +0.001 Recall@50 depending on the cap). But
+    checking its real coverage on the benchmark corpus specifically
+    (same method as "Errors found" #1) showed it would only ever fire
+    for **3.6%** of benchmark queries — most of its offline benefit comes
+    from the larger, denser train-based validation corpus, not something
+    that transfers proportionally to the smaller real one. Given the
+    added complexity for a signal this narrow, I left it out of the
+    submitted pipeline (a documented judgment call, not something proven
+    to hurt).
+
+  Both variants (`build_memo_prior`) are kept working and exercised in
+  `scripts/run_validation.py` so these comparisons stay reproducible;
+  neither is used in `scripts/generate_answer.py`.
 
 ### 4. Final ranking
 
 For each query: BM25 score over the full item corpus → add the
-location-match boost (raw location OR its redirect) → add the
-microcategory-match boost → take the top 50 by score.
+location-match boost (full strength for a raw match, confidence-weighted
+for a redirect-only match) → add the microcategory-match boost → take
+the top 50 by score.
 
 ## How I validated before submitting
 
@@ -264,7 +316,9 @@ directly on `benchmark_queries.parquet` that **37.0%** of real benchmark
 query texts also appear verbatim somewhere in `train.parquet` — almost
 identical to what a random split of train.parquet itself reproduces — so
 the offline number should transfer reasonably well to the real
-benchmark score.
+benchmark score (though not perfectly — see "Errors found" #1 for the
+concrete case where it didn't, and how that gap itself became a source
+of a real improvement).
 
 Full progression on the offline EVAL set (all numbers reproducible via
 `scripts/run_validation.py`):
@@ -273,16 +327,15 @@ Full progression on the offline EVAL set (all numbers reproducible via
 |---|---|
 | Text-only BM25 (5/3/1 weights) | 0.1896 |
 | + location boost, raw match only (`alpha_location=1.0`) | 0.7507 |
-| + location redirect (union with raw match) | 0.7816 |
-| + microcategory prior (`alpha_microcat=0.2`) | **0.8003** (final) |
-| + historical memorization on top of the above | 0.7997 (no gain, dropped) |
+| + location redirect, unweighted (union with raw match) | 0.7816 |
+| + location redirect, weighted by confidence | 0.7862 |
+| + microcategory prior (`alpha_microcat=0.2`) | **0.8040** (final) |
+| + historical memorization (query text only) on top of the above | 0.8034 (no gain, dropped) |
 
-The real benchmark score for the version *without* the location redirect
-(row 2 above, 0.7507 offline) was **0.7182** — the redirect and the
-larger/more stable validation sample (both added after that submission,
-see "Errors found" #1) are expected to close most of that ~0.03 gap,
-though the exact number on the real benchmark for the *current* pipeline
-is of course only known once it's actually submitted.
+Real benchmark scores tracked across the actual submitted iterations of
+this pipeline (see TL;DR table too): **0.7182** (raw location match
+only) → **0.7408** (+ unweighted redirect) → *pending* (+ confidence
+weighting, this version).
 
 ## Errors found during analysis, and what I did about them
 
@@ -297,9 +350,15 @@ is of course only known once it's actually submitted.
    **17.4% of benchmark queries have zero items in `benchmark_items.parquet`
    sharing their exact `search_location_id`** (vs. an implicitly higher
    coverage rate in the larger offline corpus). **Fix**: the location
-   redirect described in "Method" §0b, which recovers this gap by
-   learning where these under-served locations' searches actually resolve
-   to, historically.
+   redirect described in "Method" §0b. Resubmitting confirmed the fix
+   generalized: the real score rose to 0.7408, tracking the offline
+   improvement (0.751 → 0.800) in the same direction, if not quite the
+   same magnitude — a residual gap I don't fully know the cause of (could
+   be sample noise on only 2,452 real queries, could be some other
+   structural difference between the two corpora I haven't found yet).
+   This is also why I only trust offline deltas as *directional* evidence
+   and always sanity-check the real submission result against them rather
+   than assuming they'll match exactly.
 
 2. **Text-only BM25 was quietly leaving the single biggest signal on the
    table in the first place.** Recall@50 of 0.19 looked low for how
@@ -307,9 +366,9 @@ is of course only known once it's actually submitted.
    which prompted a direct check of whether location explains the gap. It
    did: 83.1% of historically-chosen items share their `item_location_id`
    with the query's `search_location_id`. **Fix**: added the location-match
-   boost described in "Method" §0 — together with its redirect refinement,
-   this is responsible for essentially all of the improvement in this
-   solution over plain text search.
+   boost described in "Method" §0 — together with its redirect and
+   confidence-weighting refinements, this is responsible for essentially
+   all of the improvement in this solution over plain text search.
 
 3. **Memory blow-up from template boilerplate** (`item_infm_params_text`
    is a fixed form with labels like "Вид услуги", "Место оказания услуг",
@@ -332,7 +391,8 @@ is of course only known once it's actually submitted.
    texts qualify) and cap injected items to the top 3 by frequency.
    (This was later dropped entirely once the location boost was added —
    see §3 of "Method" — but the fix itself is still the right lesson
-   about this kind of prior.)
+   about this kind of prior. Conditioning the same idea on (text, location)
+   together instead of text alone was tried too — see §3.)
 
 5. **The microcategory prior flipped from harmful to helpful once
    location was added — the most important methodological lesson here.**
