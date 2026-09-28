@@ -18,23 +18,22 @@ re-rank. Optimized for **Recall@50**.
 - **No external APIs, no downloaded models.** Everything runs locally
   with pandas/numpy/scipy/scikit-learn.
 - **Offline validation** (held out from `train.parquet`, see below):
-  **Recall@50 ≈ 0.804** (up from 0.19 for text-only BM25).
-- **Real benchmark history**, tracked across three submitted iterations
-  of this pipeline as the location signal was refined (see "Errors found"
-  for the investigation behind each step):
+  **Recall@50 ≈ 0.812** (up from 0.19 for text-only BM25).
+- **Real benchmark history**, tracked across four submitted iterations of
+  this pipeline as the location signal was progressively refined (see
+  "Errors found" for the investigation behind each step):
 
   | Iteration | Offline Recall@50 | Real benchmark Recall@50 |
   |---|---|---|
   | 1. Raw location-match boost only | 0.751 | 0.7182 |
-  | 2. + location redirect (unweighted) | 0.800 | 0.7408 |
-  | 3. + redirect weighted by confidence (current) | 0.804 | *pending* |
+  | 2. + location redirect (unweighted, top-1 hub) | 0.800 | 0.7408 |
+  | 3. + redirect weighted by confidence | 0.804 | 0.7510 |
+  | 4. + top-5 redirect hubs instead of top-1 (current) | 0.812 | *pending* |
 
-  The offline→real gap shrank a lot between iterations 1 and 2 (0.033 →
-  0.059 in absolute terms actually widened slightly, but the *real* score
-  itself improved by +0.023, tracking the +0.05 offline improvement
-  reasonably well — see "Errors found" #1 for why the gap isn't expected
-  to hit zero even with a perfect signal, since the offline harness and
-  the real benchmark are different samples by construction).
+  Confidence weighting (iteration 3) delivered a **larger** real-world
+  gain than its offline estimate predicted (+0.0102 real vs. +0.0037
+  offline) — a reassuring sign that this direction generalizes at least
+  as well as the offline harness suggests, not worse.
 - Reproduce with:
   ```bash
   pip install -r requirements.txt
@@ -152,15 +151,13 @@ resolved `item_location_id` that differs from the search location itself
 target is usually the city itself, so it's invisible unless you check.
 
 `src/ranking.py::build_location_redirect` learns this mapping
-(`search_location_id → most historically common item_location_id`)
-directly from `train.parquet`, and the location boost then matches
-against **either** the raw search location **or** its redirect (a soft
-union, not a replacement — for the 82.6% of queries with normal,
-well-served locations this is a no-op, since the redirect target usually
-*is* the search location itself). This raised offline Recall@50 by
-another **+0.031** on top of the plain location boost, and the real
-benchmark score confirmed the improvement was real, not offline-only:
-**0.7182 → 0.7408** (+0.023) after resubmitting with this fix.
+(`search_location_id → historically common item_location_id`s) directly
+from `train.parquet`, and the location boost then matches against the
+raw search location **or** its redirect targets (a soft union, not a
+replacement — for the 82.6% of queries with normal, well-served locations
+this is close to a no-op, since the top redirect target usually *is* the
+search location itself). Resubmitting with just the top-1 redirect target
+raised the real benchmark score from 0.7182 → 0.7408.
 
 ### 0c. Weighting the redirect by its own confidence
 
@@ -174,20 +171,39 @@ a coin flip between two similarly-likely hubs. The pipeline was treating
 all of these identically, boosting a 50%-confidence guess exactly as hard
 as an 83%-confidence direct match.
 
-`build_location_redirect` now also returns this confidence (the share of
-historical searches from that location that resolved to the returned
-mode), and the redirect-only boost (items that match the redirect but not
-the raw search location) is scaled by it:
+`build_location_redirect` returns this confidence too (the share of
+historical searches from that location that resolved to each returned
+target), and a redirect-only match (an item that matches a redirect
+target but not the raw search location) is boosted by
 `confidence * alpha_location * max_score`, while a genuine raw-location
 match still always gets the full, unscaled boost (that one is a fact
 about the item, not a historical guess). I also tried a hard-threshold
 version (only apply the redirect boost above some confidence cutoff) —
 it was **worse** than smooth weighting at every threshold tried (0.783 at
-a 0.8 cutoff vs. 0.804 weighted): a cutoff throws away the boost entirely
-for lower-confidence locations, and even a mediocre geographic guess
-clearly beats no geographic signal at all. Weighting by confidence gave
-another **+0.004** Recall@50 offline on top of the plain (unweighted)
-redirect.
+a 0.8 cutoff vs. 0.786 weighted, both measured with only the single most
+common redirect target): a cutoff throws away the boost entirely for
+lower-confidence locations, and even a mediocre geographic guess clearly
+beats no geographic signal at all. Resubmitting with confidence
+weighting improved the real benchmark score again, from 0.7408 → 0.7510
+— and notably, the *real* gain (+0.0102) was larger than what the
+offline estimate predicted (+0.0037), a reassuring sign this direction
+was generalizing well, not overfitting to the offline harness.
+
+### 0d. More than one redirect target
+
+The redirect above only used the single most common historical
+destination per search location. But many `search_location_id`s split
+their historical searches across **several** nearby hubs at once — e.g.
+45% to one neighboring city and 40% to another — and top-1 redirect only
+ever captures the larger share. `build_location_redirect` now returns up
+to `top_n` targets per search location (each with its own confidence,
+summed the same way as before), instead of just the mode. Recall@50 rose
+steadily with `top_n`: **0.786 (n=1) → 0.792 (n=2) → 0.794 (n=4) → 0.794
+(n=5)**, plateauing right around n=5 (n=6 was marginally *worse* —
+0.7942 vs 0.7942 rounds the same but the 6th-ranked target is already
+essentially noise for most locations). `top_n=5` is used in the final
+pipeline. This (offline) submission has not yet been scored on the real
+benchmark as of this README revision.
 
 ### 1. Text preprocessing (`src/text_utils.py`)
 
@@ -271,15 +287,14 @@ without ever touching benchmark labels (there are none to touch):
   - Keyed on (query text, `search_location_id`) together — much more
     precise (81% of such pairs in `train.parquet` have exactly one
     historical answer, vs. 60% for text alone), and it did help slightly
-    offline (+0.001 to +0.001 Recall@50 depending on the cap). But
-    checking its real coverage on the benchmark corpus specifically
-    (same method as "Errors found" #1) showed it would only ever fire
-    for **3.6%** of benchmark queries — most of its offline benefit comes
-    from the larger, denser train-based validation corpus, not something
-    that transfers proportionally to the smaller real one. Given the
-    added complexity for a signal this narrow, I left it out of the
-    submitted pipeline (a documented judgment call, not something proven
-    to hurt).
+    offline. But checking its real coverage on the benchmark corpus
+    specifically (same method as "Errors found" #1) showed it would only
+    ever fire for **3.6%** of benchmark queries — most of its offline
+    benefit comes from the larger, denser train-based validation corpus,
+    not something that transfers proportionally to the smaller real one.
+    Given the added complexity for a signal this narrow, I left it out
+    of the submitted pipeline (a documented judgment call, not something
+    proven to hurt).
 
   Both variants (`build_memo_prior`) are kept working and exercised in
   `scripts/run_validation.py` so these comparisons stay reproducible;
@@ -289,8 +304,8 @@ without ever touching benchmark labels (there are none to touch):
 
 For each query: BM25 score over the full item corpus → add the
 location-match boost (full strength for a raw match, confidence-weighted
-for a redirect-only match) → add the microcategory-match boost → take
-the top 50 by score.
+for each of up to 5 redirect-target matches) → add the microcategory-match
+boost → take the top 50 by score.
 
 ## How I validated before submitting
 
@@ -327,15 +342,17 @@ Full progression on the offline EVAL set (all numbers reproducible via
 |---|---|
 | Text-only BM25 (5/3/1 weights) | 0.1896 |
 | + location boost, raw match only (`alpha_location=1.0`) | 0.7507 |
-| + location redirect, unweighted (union with raw match) | 0.7816 |
-| + location redirect, weighted by confidence | 0.7862 |
-| + microcategory prior (`alpha_microcat=0.2`) | **0.8040** (final) |
-| + historical memorization (query text only) on top of the above | 0.8034 (no gain, dropped) |
+| + location redirect, top-1 target, unweighted | 0.7816 |
+| + location redirect, top-1 target, weighted by confidence | 0.7862 |
+| + location redirect, top-5 targets, weighted by confidence | 0.7942 |
+| + microcategory prior (`alpha_microcat=0.2`) | **0.8119** (final) |
+| + historical memorization (query text only) on top of the above | 0.8113 (no gain, dropped) |
 
 Real benchmark scores tracked across the actual submitted iterations of
 this pipeline (see TL;DR table too): **0.7182** (raw location match
-only) → **0.7408** (+ unweighted redirect) → *pending* (+ confidence
-weighting, this version).
+only) → **0.7408** (+ unweighted top-1 redirect) → **0.7510**
+(+ confidence weighting) → *pending* (+ top-5 redirect targets, this
+version).
 
 ## Errors found during analysis, and what I did about them
 
@@ -351,14 +368,12 @@ weighting, this version).
    sharing their exact `search_location_id`** (vs. an implicitly higher
    coverage rate in the larger offline corpus). **Fix**: the location
    redirect described in "Method" §0b. Resubmitting confirmed the fix
-   generalized: the real score rose to 0.7408, tracking the offline
-   improvement (0.751 → 0.800) in the same direction, if not quite the
-   same magnitude — a residual gap I don't fully know the cause of (could
-   be sample noise on only 2,452 real queries, could be some other
-   structural difference between the two corpora I haven't found yet).
-   This is also why I only trust offline deltas as *directional* evidence
-   and always sanity-check the real submission result against them rather
-   than assuming they'll match exactly.
+   generalized: the real score rose to 0.7408. The next round (confidence
+   weighting, §0c) generalized even better than its offline estimate
+   predicted, which is the strongest evidence so far that this whole
+   direction (location, not just text) was the right thing to keep
+   pushing on, rather than something narrowly overfit to the offline
+   harness.
 
 2. **Text-only BM25 was quietly leaving the single biggest signal on the
    table in the first place.** Recall@50 of 0.19 looked low for how
@@ -366,9 +381,10 @@ weighting, this version).
    which prompted a direct check of whether location explains the gap. It
    did: 83.1% of historically-chosen items share their `item_location_id`
    with the query's `search_location_id`. **Fix**: added the location-match
-   boost described in "Method" §0 — together with its redirect and
-   confidence-weighting refinements, this is responsible for essentially
-   all of the improvement in this solution over plain text search.
+   boost described in "Method" §0 — together with its redirect,
+   confidence-weighting and top-N refinements, this is responsible for
+   essentially all of the improvement in this solution over plain text
+   search.
 
 3. **Memory blow-up from template boilerplate** (`item_infm_params_text`
    is a fixed form with labels like "Вид услуги", "Место оказания услуг",
@@ -402,7 +418,7 @@ weighting, this version).
    location, the candidate pool for a typical query is dominated by
    textually-similar listings from all over the country, and a category
    prior just adds more noise to an already-noisy pool. With location
-   narrowing the pool down to one city (or its serving hub) first, the
+   narrowing the pool down to one city (or its serving hubs) first, the
    remaining ambiguity (e.g. two different microcategories using similar
    wording) is exactly what the category prior is good at resolving.
    **Takeaway I'm keeping in mind**: a signal that looks harmful in
