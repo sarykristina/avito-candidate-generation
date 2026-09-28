@@ -47,6 +47,17 @@ README.ru.md):
      Меморизация точных исторических объявлений (была в более ранней
      версии решения) не используется -- перестала давать прирост после
      добавления буста по локации (см. README.md).
+  3б. Расширение кандидатов по локации (`build_location_index`) --
+     САМОЕ крупное по эффекту улучшение из всех перечисленных. Все бусты
+     выше применялись только к объявлениям, которые BM25 и так уже нашёл
+     по тексту; если у релевантного объявления НЕТ общих слов с запросом
+     вообще, оно физически не могло попасть в кандидаты. Проверка по
+     train.parquet показала: у 3.1% релевантных объявлений в правильной
+     локации нет ни единого общего слова с запросом. Теперь ВСЕ
+     объявления из локации поиска и её редирект-адресатов гарантированно
+     становятся кандидатами (с нулевым текстовым скором, если BM25 их не
+     нашёл), а не только те, что случайно разделили хоть одно слово с
+     запросом (см. src/ranking.py, "ПЯТЫЙ СЛОЙ").
   4. Топ-50 объявлений на запрос (по итоговому скору) записываются в
      answer.csv, дополнительно проходя проверку на соответствие всем
      требованиям формата из задания.
@@ -63,7 +74,7 @@ import pandas as pd
 sys.path.insert(0, ".")
 from src.data_prep import build_item_corpus_text, build_query_text, normalize_query_text
 from src.bm25 import BM25Index
-from src.ranking import rank_all, build_location_redirect
+from src.ranking import rank_all, build_location_redirect, build_location_index
 
 K = 50
 
@@ -112,6 +123,10 @@ def main():
     item_ids = items.index.to_numpy()
     item_microcat = items["item_microcat_id"].to_numpy()
     item_location = items["item_location_id"].to_numpy()
+    # Индекс "локация -> позиции объявлений" -- нужен, чтобы гарантированно
+    # добавлять в кандидаты ВСЕ объявления нужной локации, даже с нулевым
+    # текстовым скором (см. src/ranking.py, "ПЯТЫЙ СЛОЙ").
+    location_index = build_location_index(item_location)
 
     log(t0, "Строю текст корпуса объявлений и обучаю BM25-индекс ...")
     item_texts = build_item_corpus_text(items)
@@ -155,6 +170,7 @@ def main():
         qtext_to_items, qtext_to_microcat,
         item_location=item_location, search_location_list=search_location_list,
         search_location_redirect_targets=search_location_redirect_targets,
+        location_index=location_index,
         k=K, alpha_microcat=ALPHA_MICROCAT, alpha_location=ALPHA_LOCATION,
         chunk_size=CHUNK,
     )
