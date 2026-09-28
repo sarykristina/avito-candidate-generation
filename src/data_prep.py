@@ -67,3 +67,24 @@ def build_query_text(queries: pd.DataFrame) -> pd.Series:
         parts = [(row[f], w) for f, w in QUERY_FIELD_WEIGHTS.items()]
         return build_weighted_text(parts)
     return queries.apply(_row_text, axis=1)
+
+
+def build_fuzzy_item_text(items: pd.DataFrame) -> pd.Series:
+    """Сырой (без повторения токенов -- TF-IDF по символьным n-граммам
+    сам нормирует частоты, весовой трюк здесь не нужен) текст объявления
+    для src/fuzzy.py::FuzzyIndex: заголовок + структурированные параметры,
+    нижний регистр. Описание сюда намеренно не включено -- оно самое
+    длинное и шумное поле, а символьные n-граммы и так менее точны, чем
+    слова, добавлять им ещё и шум от длинных описаний не стоило."""
+    return (
+        items["item_title_raw"].fillna("").str.lower()
+        + " " + items["item_infm_params_text"].fillna("").str.lower()
+    )
+
+
+def build_fuzzy_query_text(queries: pd.DataFrame) -> pd.Series:
+    """То же самое для запросов: search_query + search_infm_params_text."""
+    return (
+        queries["search_query"].fillna("").str.lower()
+        + " " + queries["search_infm_params_text"].fillna("").str.lower()
+    )
