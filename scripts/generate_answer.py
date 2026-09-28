@@ -33,6 +33,12 @@ README.ru.md):
          `build_location_redirect` учит по train.parquet, в какой
          "хаб" (обычно ближайший крупный город) реально ведут такие
          поиски, и буст проверяет совпадение с ЛЮБОЙ из двух локаций.
+         Уверенность редиректа (какая доля поисков из этой локации
+         реально привела к этому хабу) варьируется от локации к
+         локации -- буст по редиректу масштабируется этой уверенностью,
+         а не применяется всегда в полную силу, как прямое совпадение
+         (см. src/ranking.py: наивное полносильное применение оказалось
+         хуже взвешенного на офлайн-валидации).
        - буст по микрокатегории, которую пользователи исторически
          выбирали для этого текста запроса -- полезен именно вместе с
          бустом по локации (см. src/ranking.py).
@@ -122,17 +128,23 @@ def main():
     qtext_to_microcat = train.groupby("_qtext_norm")["item_microcat_id"].agg(
         lambda x: x.value_counts(normalize=True).to_dict()
     )
-    location_redirect = build_location_redirect(
+    location_redirect, location_redirect_confidence = build_location_redirect(
         train["search_location_id"], train["item_location_id"]
     )
     # Если для какого-то search_location_id из бенчмарка вообще не было
     # строк в train.parquet (не должно случаться -- все 58 "проблемных"
     # локаций бенчмарка встретились в train.parquet, см. README.md), на
     # всякий случай откатываемся на саму локацию поиска (тогда буст по
-    # редиректу просто выродится в обычное прямое совпадение).
+    # редиректу просто выродится в обычное прямое совпадение) и на
+    # уверенность 1.0 (не занижаем полносильный буст прямого совпадения).
     search_location_redirect_list = (
         queries["search_location_id"].map(location_redirect)
         .fillna(queries["search_location_id"])
+        .to_numpy()
+    )
+    search_location_redirect_confidence = (
+        queries["search_location_id"].map(location_redirect_confidence)
+        .fillna(1.0)
         .to_numpy()
     )
     # Меморизация точных объявлений (qtext_to_items) в этом пайплайне не
@@ -146,6 +158,7 @@ def main():
         qtext_to_items, qtext_to_microcat,
         item_location=item_location, search_location_list=search_location_list,
         search_location_redirect_list=search_location_redirect_list,
+        search_location_redirect_confidence=search_location_redirect_confidence,
         k=K, alpha_microcat=ALPHA_MICROCAT, alpha_location=ALPHA_LOCATION,
         chunk_size=CHUNK,
     )
