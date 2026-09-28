@@ -58,6 +58,14 @@ README.ru.md):
      становятся кандидатами (с нулевым текстовым скором, если BM25 их не
      нашёл), а не только те, что случайно разделили хоть одно слово с
      запросом (см. src/ranking.py, "ПЯТЫЙ СЛОЙ").
+  3в. Нечёткое сопоставление по символьным n-граммам (`src/fuzzy.py`) --
+     небольшая добавка к скору по косинусной близости TF-IDF на
+     3-5-граммах символов, поверх точного по словам BM25. Ловит
+     словоформы/опечатки/разное разбиение составных слов, которые точная
+     токенизация по словам пропускает, и особенно полезна для кандидатов
+     из п.3б с нулевым BM25-скором. Офлайн-валидация показала узкий пик
+     на alpha_fuzzy=0.1 (+0.0034 Recall@50 сверх пайплайна без неё), при
+     заметно большем весе сигнал вредит (см. src/ranking.py, src/fuzzy.py).
   4. Топ-50 объявлений на запрос (по итоговому скору) записываются в
      answer.csv, дополнительно проходя проверку на соответствие всем
      требованиям формата из задания.
@@ -72,8 +80,12 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, ".")
-from src.data_prep import build_item_corpus_text, build_query_text, normalize_query_text
+from src.data_prep import (
+    build_item_corpus_text, build_query_text, normalize_query_text,
+    build_fuzzy_item_text, build_fuzzy_query_text,
+)
 from src.bm25 import BM25Index
+from src.fuzzy import FuzzyIndex
 from src.ranking import rank_all, build_location_redirect, build_location_index
 
 K = 50
@@ -90,8 +102,14 @@ K = 50
 #     буста по локации (без локации этот буст вредил и был отключён);
 #     на выборке в 8000 offline-запросов пик находится в районе 0.2-0.3
 #     (различия там уже в пределах шума), берём середину этого плато.
+#   - ALPHA_FUZZY=0.1 -- пик узкий (см. src/fuzzy.py): полный перебор по
+#     сетке на 5000 offline-запросах (scripts/run_validation.py) дал
+#     0.05->0.8261, 0.08->0.8261, 0.1->0.8268 (максимум), 0.12->0.8253,
+#     0.15->0.8262, 0.2->0.8256, дальше монотонно хуже вплоть до
+#     2.0->0.7432 (базовый пайплайн без fuzzy: 0.8234).
 ALPHA_LOCATION = 1.0
 ALPHA_MICROCAT = 0.2
+ALPHA_FUZZY = 0.1
 MAX_DF = 0.4
 CHUNK = 200
 
@@ -133,8 +151,14 @@ def main():
     bm25 = BM25Index(k1=1.5, b=0.75, min_df=2, max_df=MAX_DF).fit(item_texts)
     log(t0, f"размер словаря={len(bm25.vectorizer.vocabulary_)}")
 
+    log(t0, "Строю индекс нечёткого сопоставления по символьным n-граммам ...")
+    fuzzy_item_texts = build_fuzzy_item_text(items)
+    fuzzy_index = FuzzyIndex().fit(fuzzy_item_texts)
+    log(t0, f"словарь символьных n-грамм={len(fuzzy_index.vectorizer.vocabulary_)}")
+
     log(t0, "Строю текст запросов ...")
     query_texts = build_query_text(queries).tolist()
+    fuzzy_query_texts = build_fuzzy_query_text(queries).tolist()
     # Нормализованный "сырой" текст запроса -- ключ словаря для
     # qtext_to_microcat (микрокатегорийный prior строится по точному
     # совпадению текста запроса, а не по взвешенному BM25-тексту).
@@ -171,7 +195,9 @@ def main():
         item_location=item_location, search_location_list=search_location_list,
         search_location_redirect_targets=search_location_redirect_targets,
         location_index=location_index,
+        fuzzy_index=fuzzy_index, fuzzy_query_texts=fuzzy_query_texts,
         k=K, alpha_microcat=ALPHA_MICROCAT, alpha_location=ALPHA_LOCATION,
+        alpha_fuzzy=ALPHA_FUZZY,
         chunk_size=CHUNK,
     )
     log(t0, "ранжирование завершено")

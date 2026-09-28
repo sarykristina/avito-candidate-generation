@@ -51,8 +51,12 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, ".")
-from src.data_prep import build_item_corpus_text, build_query_text, normalize_query_text
+from src.data_prep import (
+    build_item_corpus_text, build_query_text, normalize_query_text,
+    build_fuzzy_item_text, build_fuzzy_query_text,
+)
 from src.bm25 import BM25Index
+from src.fuzzy import FuzzyIndex
 from src.eval_utils import recall_at_k
 from src.ranking import rank_all, build_memo_prior, build_location_redirect, build_location_index
 
@@ -132,8 +136,14 @@ def build_setup(t0):
     bm25 = BM25Index(k1=1.5, b=0.75, min_df=2, max_df=0.4).fit(item_texts)
     log(t0, f"размер словаря={len(bm25.vectorizer.vocabulary_)}")
 
+    log(t0, "Обучаю индекс нечёткого сопоставления по символьным n-граммам ...")
+    fuzzy_item_texts = build_fuzzy_item_text(items)
+    fuzzy_index = FuzzyIndex().fit(fuzzy_item_texts)
+    log(t0, f"словарь символьных n-грамм={len(fuzzy_index.vectorizer.vocabulary_)}")
+
     log(t0, "Строю текст EVAL-запросов ...")
     eval_query_texts = build_query_text(eval_query_df).tolist()
+    eval_fuzzy_query_texts = build_fuzzy_query_text(eval_query_df).tolist()
     eval_qtext_list = eval_query_df["_qtext_norm"].tolist()
     eval_search_location = eval_query_df["search_location_id"].to_numpy()
     true_relevant = list(relevant_sets.values)
@@ -164,6 +174,7 @@ def build_setup(t0):
     setup = dict(
         bm25=bm25, item_ids=item_ids, item_microcat=item_microcat,
         item_location=item_location, location_index=location_index,
+        fuzzy_index=fuzzy_index, eval_fuzzy_query_texts=eval_fuzzy_query_texts,
         eval_query_texts=eval_query_texts, eval_qtext_list=eval_qtext_list,
         eval_search_location=eval_search_location,
         eval_search_location_redirect_targets=eval_search_location_redirect_targets,
@@ -217,7 +228,8 @@ def main():
             out.append(row)
         return out
 
-    def evaluate(label, redirect_top_n=5, weight_redirect=True, use_location_index=False, **kwargs):
+    def evaluate(label, redirect_top_n=5, weight_redirect=True, use_location_index=False,
+                 use_fuzzy=False, **kwargs):
         ranked = rank_all(
             s["eval_query_texts"], s["eval_qtext_list"], s["bm25"],
             s["item_ids"], s["item_microcat"],
@@ -225,6 +237,8 @@ def main():
             search_location_list=s["eval_search_location"],
             search_location_redirect_targets=make_targets(redirect_top_n, weight_redirect),
             location_index=s["location_index"] if use_location_index else None,
+            fuzzy_index=s["fuzzy_index"] if use_fuzzy else None,
+            fuzzy_query_texts=s["eval_fuzzy_query_texts"] if use_fuzzy else None,
             k=K, chunk_size=CHUNK, **kwargs,
         )
         r, _ = recall_at_k(s["true_relevant"], ranked, k=K)
@@ -338,6 +352,22 @@ def main():
              redirect_top_n=5, weight_redirect=True, use_location_index=True,
              qtext_to_items=empty_series, qtext_to_microcat=s["qtext_to_microcat"],
              alpha_microcat=0.2, alpha_location=1.0)
+
+    # 10) Нечёткое сопоставление по символьным n-граммам (src/fuzzy.py)
+    #     поверх лучшей на данный момент связки (локация + редирект(top-5)
+    #     + микрокатегория(0.2) + расширение по локации). Особенно
+    #     интересно для кандидатов из п.9 с нулевым BM25-скором -- для них
+    #     символьное сходство может быть единственным текстовым сигналом.
+    #     Перебор веса должен показать узкий пик и последующую деградацию
+    #     (см. докстринг src/ranking.py и src/fuzzy.py) -- сигнал сам по
+    #     себе шумнее точного совпадения слов, поэтому должен участвовать
+    #     только с небольшим весом, "дозаполняя" слепые зоны, а не
+    #     конкурируя с надёжными сигналами.
+    for alpha_fz in [0.05, 0.08, 0.1, 0.12, 0.15, 0.2, 0.3, 0.5, 1.0, 2.0]:
+        evaluate(f"... + расширение по локации + нечёткое сопоставление(alpha={alpha_fz})",
+                 redirect_top_n=5, weight_redirect=True, use_location_index=True, use_fuzzy=True,
+                 qtext_to_items=empty_series, qtext_to_microcat=s["qtext_to_microcat"],
+                 alpha_microcat=0.2, alpha_location=1.0, alpha_fuzzy=alpha_fz)
 
     log(t0, "готово")
 
