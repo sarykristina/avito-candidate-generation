@@ -56,10 +56,31 @@
    незамеченной. `build_location_redirect` берёт не одну моду, а до
    `top_n` самых частых адресатов для каждой локации (каждый -- со своей
    confidence), и буст проверяет совпадение с любым из них, каждый раз
-   взвешивая своей уверенностью. Recall@50 растёт с top_n=1 (0.804) до
-   top_n=5 (0.812) и на этом выходит на плато (top_n=6 уже чуть хуже --
-   шестой по частоте адресат для большинства локаций это уже шум) -- см.
-   README.md за полную таблицу.
+   взвешивая своей уверенностью.
+
+   ПЯТЫЙ СЛОЙ, самый крупный из всех по эффекту, -- расширение кандидатов
+   ПО ЛОКАЦИИ, а не только переранжирование уже найденных BM25. Все
+   предыдущие слои буста применялись ТОЛЬКО к объявлениям, которые BM25
+   и так уже нашёл по тексту (ненулевое лексическое пересечение) -- если
+   у релевантного объявления НЕТ ни одного общего слова с запросом, оно
+   физически не попадало в кандидаты, сколько бы буста по локации ни
+   давали. Прямая проверка по train.parquet показала: у 3.1% релевантных
+   объявлений, лежащих в правильной локации, вообще нет пересечения по
+   словам с запросом -- слепая зона, которую никакой пере-ранжирующий
+   буст не мог закрыть. Решение: `build_location_index` + параметр
+   `location_index` в `boosted_top_k` ГАРАНТИРУЮТ, что абсолютно все
+   объявления из локации поиска и её top-N редирект-адресатов попадают в
+   кандидаты, даже если BM25 совсем не нашёл в них текста (в этом случае
+   их скор -- просто соответствующий буст по локации, без вклада текста).
+   Проверялось ограничение сверху на размер локации (чтобы не тащить
+   тысячи объявлений мегагородов) -- recall монотонно рос с увеличением
+   лимита и был лучше всего БЕЗ ограничения вовсе (0.812 с лимитом top-5
+   редиректов без расширения -> 0.823 без ограничения на размер локации),
+   поэтому ограничение не используется: добавление кандидатов может
+   только помочь (итоговый топ-50 всё равно выбирается по общему скору;
+   лишние кандидаты с нулевым текстовым скором просто проигрывают более
+   сильным) и никогда не вредит, только замедляет расчёт для очень
+   крупных локаций.
 
 1. Prior по микрокатегории: если такой (нормализованный) текст запроса
    уже встречался раньше, смотрим, в каких item_microcat_id пользователи
@@ -166,6 +187,26 @@ def build_location_redirect(search_location_series, item_location_series, top_n=
     return pd.Series(result, dtype=object)
 
 
+def build_location_index(item_location):
+    """Построить индекс "item_location_id -> np.array позиций объявлений
+    с этой локацией" (позиции -- индексы в item_location, согласованные с
+    item_ids_sorted / item_microcat и т.д. по всему пайплайну).
+
+    Нужен для ГАРАНТИРОВАННОГО расширения кандидатов по локации в
+    `boosted_top_k` (см. "ПЯТЫЙ СЛОЙ" в докстринге модуля) -- без этого
+    индекса объявления без общих слов с запросом никогда не попадают в
+    кандидаты, даже если они точно в нужном городе.
+
+    Возвращает dict[item_location_id -> np.ndarray[int]].
+    """
+    order = np.argsort(item_location, kind="stable")
+    sorted_loc = item_location[order]
+    boundaries = np.flatnonzero(np.diff(sorted_loc)) + 1
+    groups = np.split(order, boundaries)
+    unique_locs = sorted_loc[np.concatenate(([0], boundaries))]
+    return dict(zip(unique_locs.tolist(), groups))
+
+
 def rank_all(
     query_texts,
     qtext_norm_list,
@@ -177,6 +218,7 @@ def rank_all(
     item_location=None,
     search_location_list=None,
     search_location_redirect_targets=None,
+    location_index=None,
     k=50,
     alpha_microcat=0.5,
     alpha_location=0.0,
@@ -189,9 +231,11 @@ def rank_all(
     порции, возвращая объединённые ранжированные списки item_id по
     каждому запросу в исходном порядке.
 
-    item_location / search_location_list / search_location_redirect_targets
-    -- см. boosted_top_k; можно оставить None (или alpha_location=0.0),
-    если буст по локации не нужен."""
+    item_location / search_location_list / search_location_redirect_targets /
+    location_index -- см. boosted_top_k; можно оставить None (или
+    alpha_location=0.0), если буст по локации не нужен. location_index
+    (результат build_location_index) не зависит от конкретного чанка
+    запросов, поэтому передаётся как есть, без нарезки по чанкам."""
     results = []
     for start in range(0, len(query_texts), chunk_size):
         chunk_texts = query_texts[start:start + chunk_size]
@@ -208,6 +252,7 @@ def rank_all(
         results.extend(boosted_top_k(
             chunk_qtext, scores_chunk, item_ids_sorted, item_microcat,
             qtext_to_items, qtext_to_microcat,
+            location_index=location_index,
             item_location=item_location, search_location_list=chunk_loc,
             search_location_redirect_targets=chunk_loc_targets,
             k=k, alpha_microcat=alpha_microcat, alpha_location=alpha_location,
@@ -226,6 +271,7 @@ def boosted_top_k(
     item_location=None,
     search_location_list=None,
     search_location_redirect_targets=None,
+    location_index=None,
     k=50,
     alpha_microcat=0.5,
     alpha_location=0.0,
@@ -258,6 +304,15 @@ def boosted_top_k(
                                 (результат build_location_redirect; можно
                                 не передавать, тогда буст сработает только
                                 по прямому совпадению)
+      location_index          -- dict[item_location_id -> np.ndarray позиций]
+                                (результат build_location_index). Если
+                                передан, ВСЕ объявления из локации поиска
+                                и её редирект-адресатов гарантированно
+                                попадают в кандидаты, даже с нулевым
+                                BM25-скором (см. "ПЯТЫЙ СЛОЙ" в докстринге
+                                модуля). Если не передан, буст по локации
+                                только переранжирует то, что и так нашёл
+                                BM25 -- прежнее, более узкое поведение.
     """
     results = []
     n = bm25_scores_csr.shape[0]
@@ -272,20 +327,56 @@ def boosted_top_k(
         qtext = qtext_norm_list[i]
         max_v = vals.max() if len(vals) else 1.0
 
+        # --- Расширение кандидатов по локации (см. "ПЯТЫЙ СЛОЙ" в
+        # докстринге модуля): до применения самого буста добавляем в
+        # cols/vals -- с нулевым "текстовым" скором -- все объявления из
+        # локации поиска и её редирект-адресатов, которых BM25 ещё не
+        # нашёл (нет общих слов с запросом). Без этого шага такие
+        # объявления в принципе не могли попасть в кандидаты, сколько бы
+        # буста по локации ни давали -- см. README.md, где показано, что
+        # это самое крупное по эффекту улучшение в решении. ---
+        raw_loc = search_location_list[i] if search_location_list is not None else None
+        targets = (
+            search_location_redirect_targets[i]
+            if search_location_redirect_targets is not None else None
+        ) or []
+        if alpha_location > 0 and location_index is not None and raw_loc is not None:
+            base_cols = cols
+            processed_locs = {raw_loc}
+            extra_chunks = []
+            positions = location_index.get(raw_loc)
+            if positions is not None:
+                extra = np.setdiff1d(positions, base_cols, assume_unique=False)
+                if len(extra):
+                    extra_chunks.append(extra)
+            for target_loc, _confidence in targets:
+                if target_loc in processed_locs:
+                    # У "нормальных" локаций топ-адресат редиректа часто
+                    # совпадает с самой локацией поиска -- не обрабатываем
+                    # её дважды (иначе получим дублирующиеся кандидаты).
+                    continue
+                processed_locs.add(target_loc)
+                positions = location_index.get(target_loc)
+                if positions is not None:
+                    extra = np.setdiff1d(positions, base_cols, assume_unique=False)
+                    if len(extra):
+                        extra_chunks.append(extra)
+            if extra_chunks:
+                all_extra = np.concatenate(extra_chunks)
+                cols = np.concatenate([cols, all_extra])
+                vals = np.concatenate([vals, np.zeros(len(all_extra))])
+
         # --- Буст по локации: главный сигнал в этом решении (см.
         # докстринг модуля). Прямое совпадение (search_location_list)
         # получает полный буст -- это достоверный факт из данных
         # объявления, а не оценка. Совпадение с одним из "редирект"-
         # адресатов (search_location_redirect_targets) получает буст,
         # взвешенный его собственной уверенностью -- иначе мы бы
-        # одинаково доверяли надёжному и ненадёжному редиректу. Буст
-        # затрагивает только объявления, которые BM25 и так уже нашёл по
-        # тексту (в cols) -- он переупорядочивает уже отобранный
-        # кандидат-пул, а не расширяет его за пределы текстового
-        # пересечения. ---
-        if alpha_location > 0 and len(cols) and item_location is not None:
+        # одинаково доверяли надёжному и ненадёжному редиректу. Применяется
+        # уже к расширенному (см. выше) списку кандидатов. ---
+        if alpha_location > 0 and len(cols) and item_location is not None and raw_loc is not None:
             cand_loc = item_location[cols]
-            raw_match = cand_loc == search_location_list[i]
+            raw_match = cand_loc == raw_loc
             if raw_match.any():
                 # При alpha_location=1.0 буст уже гарантированно выводит
                 # все объявления из подходящей локации выше любых
@@ -296,15 +387,13 @@ def boosted_top_k(
                 # не меняет -- офлайн-эксперимент подтвердил плато
                 # Recall@50 от alpha=1.0 до 50.
                 vals[raw_match] += alpha_location * max_v
-            if search_location_redirect_targets is not None:
+            if targets:
                 already = raw_match
-                targets = search_location_redirect_targets[i]
-                if targets:
-                    for target_loc, confidence in targets:
-                        m = (cand_loc == target_loc) & ~already
-                        if m.any():
-                            vals[m] += confidence * alpha_location * max_v
-                            already = already | m
+                for target_loc, confidence in targets:
+                    m = (cand_loc == target_loc) & ~already
+                    if m.any():
+                        vals[m] += confidence * alpha_location * max_v
+                        already = already | m
 
         # --- Буст по микрокатегории: см. докстринг модуля -- вреден без
         # буста по локации, полезен вместе с ним. ---
