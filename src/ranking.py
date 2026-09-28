@@ -27,15 +27,31 @@
    показала, что для 44% всех различных `search_location_id` самый
    частый исторически выбранный `item_location_id` -- это НЕ он сам, а
    один и тот же "соседний хаб" (обычно ближайший крупный город, который
-   фактически обслуживает этот маленький населённый пункт), причём эта
-   мода объясняет 75-80% выборов для таких локаций. `build_location_redirect`
-   учит это отображение `search_location_id -> самый частый
-   item_location_id` по всей истории запросов, и буст проверяет
-   совпадение с ЛЮБЫМ из двух: и с исходной локацией поиска, и с её
-   "редиректом". На офлайн-валидации это дало дополнительные
-   +0.035 Recall@50 сверх обычного буста по локации (0.767 -> 0.802 при
-   уже включённом prior'е по микрокатегории) -- второй по значимости
-   сигнал в решении после самого факта использования локации.
+   фактически обслуживает этот маленький населённый пункт).
+   `build_location_redirect` учит это отображение `search_location_id ->
+   самый частый item_location_id` по всей истории запросов, и буст
+   проверяет совпадение с ЛЮБЫМ из двух: и с исходной локацией поиска, и
+   с её "редиректом". На офлайн-валидации это дало дополнительные
+   +0.031 Recall@50 сверх обычного буста по локации -- второй по
+   значимости сигнал в решении после самого факта использования локации.
+
+   ТРЕТИЙ СЛОЙ -- уверенность редиректа. "Мода" (самый частый адресат)
+   объясняет для разных search_location_id от ~5% до 100% исторических
+   выборов -- где-то это уверенный вывод, а где-то почти угадывание
+   наугад между двумя примерно равновероятными соседними хабами. Слепо
+   применять полный буст (как к прямому совпадению) в обоих случаях
+   означало бы одинаково доверять надёжному и ненадёжному сигналу.
+   Поэтому буст по редиректу (в отличие от буста по прямому совпадению)
+   масштабируется на `confidence` -- долю исторических поисков из этой
+   локации, которые реально привели к этой моде (второй элемент кортежа,
+   который возвращает `build_location_redirect`). Проверялись также
+   вариант с жёстким порогом уверенности (буст либо есть, либо нет) -- он
+   оказался ХУЖЕ плавного взвешивания: слишком высокий порог полностью
+   исключает буст для многих локаций, для которых даже не самый надёжный
+   редирект всё равно лучше, чем никакого гео-сигнала вообще (0.783 при
+   пороге 0.8 против 0.804 при плавном взвешивании). Взвешивание по
+   уверенности добавило ещё +0.004 Recall@50 к обычному (полносильному)
+   редиректу.
 
 1. Prior по микрокатегории: если такой (нормализованный) текст запроса
    уже встречался раньше, смотрим, в каких item_microcat_id пользователи
@@ -104,27 +120,35 @@ def build_memo_prior(qtext_series, item_id_series, max_distinct=5, top_n=3):
 
 
 def build_location_redirect(search_location_series, item_location_series):
-    """Построить отображение "search_location_id -> самый частый
-    исторически выбранный item_location_id" по строкам лога запросов
-    (например, train.parquet).
+    """Построить отображение "search_location_id -> (самый частый
+    исторически выбранный item_location_id, его уверенность)" по строкам
+    лога запросов (например, train.parquet).
 
     Нужно для запросов из небольших городов/районов, у которых нет
     собственных исполнителей: прямое совпадение item_location_id ==
     search_location_id для них никогда не сработает, зато почти всегда
     есть один и тот же доминирующий "хаб", который их фактически
     обслуживает (см. докстринг модуля выше -- для 44% различных
-    search_location_id мода НЕ совпадает с самим значением, и эта мода
-    объясняет 75-80% исторических выборов). Для "нормальных" локаций,
-    где сами люди обычно находят исполнителя в своём же городе, мода
-    естественным образом совпадает с самим search_location_id, так что
-    отдельно выделять эти два случая не нужно -- redirect(loc) == loc
-    получается сам собой в подавляющем большинстве случаев.
+    search_location_id мода НЕ совпадает с самим значением). Для
+    "нормальных" локаций, где сами люди обычно находят исполнителя в
+    своём же городе, мода естественным образом совпадает с самим
+    search_location_id, так что отдельно выделять эти два случая не
+    нужно -- redirect(loc) == loc получается сам собой в подавляющем
+    большинстве случаев.
 
-    Возвращает pd.Series: search_location_id -> item_location_id (мода).
+    `confidence` -- это доля исторических поисков из данной локации,
+    которые действительно привели к этой моде (value_counts деленный на
+    общее число). Используется, чтобы не доверять редиректу с низкой
+    уверенностью так же сильно, как прямому совпадению (см. докстринг
+    модуля выше).
+
+    Возвращает (location_map, confidence_map) -- две pd.Series с
+    одинаковым индексом search_location_id.
     """
-    return item_location_series.groupby(search_location_series).agg(
-        lambda s: s.value_counts().idxmax()
-    )
+    grouped = item_location_series.groupby(search_location_series)
+    location_map = grouped.agg(lambda s: s.value_counts().idxmax())
+    confidence_map = grouped.agg(lambda s: s.value_counts(normalize=True).iloc[0])
+    return location_map, confidence_map
 
 
 def rank_all(
@@ -138,6 +162,7 @@ def rank_all(
     item_location=None,
     search_location_list=None,
     search_location_redirect_list=None,
+    search_location_redirect_confidence=None,
     k=50,
     alpha_microcat=0.5,
     alpha_location=0.0,
@@ -150,11 +175,11 @@ def rank_all(
     порции, возвращая объединённые ранжированные списки item_id по
     каждому запросу в исходном порядке.
 
-    item_location / search_location_list / search_location_redirect_list
-    -- см. boosted_top_k; можно оставить None (или alpha_location=0.0),
-    если буст по локации не нужен. search_location_redirect_list можно
-    не передавать (или сделать равным search_location_list) -- тогда
-    буст сработает только по прямому совпадению."""
+    item_location / search_location_list / search_location_redirect_list /
+    search_location_redirect_confidence -- см. boosted_top_k; можно
+    оставить None (или alpha_location=0.0), если буст по локации не
+    нужен. search_location_redirect_list/confidence можно не передавать
+    -- тогда буст сработает только по прямому совпадению."""
     results = []
     for start in range(0, len(query_texts), chunk_size):
         chunk_texts = query_texts[start:start + chunk_size]
@@ -167,12 +192,17 @@ def rank_all(
             search_location_redirect_list[start:start + chunk_size]
             if search_location_redirect_list is not None else None
         )
+        chunk_loc_redirect_conf = (
+            search_location_redirect_confidence[start:start + chunk_size]
+            if search_location_redirect_confidence is not None else None
+        )
         scores_chunk = next(bm25_index.score_chunked(chunk_texts, chunk_size=len(chunk_texts)))
         results.extend(boosted_top_k(
             chunk_qtext, scores_chunk, item_ids_sorted, item_microcat,
             qtext_to_items, qtext_to_microcat,
             item_location=item_location, search_location_list=chunk_loc,
             search_location_redirect_list=chunk_loc_redirect,
+            search_location_redirect_confidence=chunk_loc_redirect_conf,
             k=k, alpha_microcat=alpha_microcat, alpha_location=alpha_location,
             memo_bonus=memo_bonus,
         ))
@@ -189,6 +219,7 @@ def boosted_top_k(
     item_location=None,
     search_location_list=None,
     search_location_redirect_list=None,
+    search_location_redirect_confidence=None,
     k=50,
     alpha_microcat=0.5,
     alpha_location=0.0,
@@ -217,9 +248,16 @@ def boosted_top_k(
       search_location_list   -- list, search_location_id для каждой строки
                                 запроса (нужен, только если alpha_location > 0)
       search_location_redirect_list -- list, "редирект" локации для каждой
-                                строки (результат build_location_redirect;
-                                можно не передавать, тогда используется
-                                только прямое совпадение)
+                                строки (первый элемент результата
+                                build_location_redirect; можно не
+                                передавать, тогда используется только
+                                прямое совпадение)
+      search_location_redirect_confidence -- list, уверенность редиректа
+                                (второй элемент результата
+                                build_location_redirect) для каждой
+                                строки; если не передать, буст по
+                                редиректу применяется в полную силу
+                                (как прямое совпадение)
     """
     results = []
     n = bm25_scores_csr.shape[0]
@@ -235,19 +273,19 @@ def boosted_top_k(
         max_v = vals.max() if len(vals) else 1.0
 
         # --- Буст по локации: главный сигнал в этом решении (см.
-        # докстринг модуля). Совпадение проверяется с ЛЮБОЙ из двух
-        # локаций -- исходной (search_location_list) и её "редиректом"
-        # (search_location_redirect_list), что покрывает и обычные
-        # случаи, и запросы из небольших городов без своих исполнителей.
+        # докстринг модуля). Прямое совпадение (search_location_list)
+        # получает полный буст -- это достоверный факт из данных
+        # объявления, а не оценка. Совпадение только по "редиректу"
+        # (search_location_redirect_list) получает буст, взвешенный по
+        # его уверенности (search_location_redirect_confidence) -- иначе
+        # мы бы одинаково доверяли надёжному и ненадёжному редиректу.
         # Буст затрагивает только объявления, которые BM25 и так уже
         # нашёл по тексту (в cols) -- он переупорядочивает уже отобранный
         # кандидат-пул, а не расширяет его за пределы текстового
         # пересечения. ---
         if alpha_location > 0 and len(cols) and item_location is not None:
-            loc_match = item_location[cols] == search_location_list[i]
-            if search_location_redirect_list is not None:
-                loc_match = loc_match | (item_location[cols] == search_location_redirect_list[i])
-            if loc_match.any():
+            raw_match = item_location[cols] == search_location_list[i]
+            if raw_match.any():
                 # При alpha_location=1.0 буст уже гарантированно выводит
                 # все объявления из подходящей локации выше любых
                 # объявлений из других локаций для этого запроса (т.к.
@@ -256,7 +294,16 @@ def boosted_top_k(
                 # максимум). Дальнейшее увеличение alpha_location ничего
                 # не меняет -- офлайн-эксперимент подтвердил плато
                 # Recall@50 от alpha=1.0 до 50.
-                vals[loc_match] += alpha_location * max_v
+                vals[raw_match] += alpha_location * max_v
+            if search_location_redirect_list is not None:
+                redirect_match = item_location[cols] == search_location_redirect_list[i]
+                only_redirect = redirect_match & ~raw_match
+                if only_redirect.any():
+                    confidence = (
+                        search_location_redirect_confidence[i]
+                        if search_location_redirect_confidence is not None else 1.0
+                    )
+                    vals[only_redirect] += confidence * alpha_location * max_v
 
         # --- Буст по микрокатегории: см. докстринг модуля -- вреден без
         # буста по локации, полезен вместе с ним. ---
