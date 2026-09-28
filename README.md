@@ -18,7 +18,9 @@ re-rank. Optimized for **Recall@50**.
 - **No external APIs, no downloaded models.** Everything runs locally
   with pandas/numpy/scipy/scikit-learn.
 - **Offline validation** (held out from `train.parquet`, see below):
-  **Recall@50 ≈ 0.823** (up from 0.19 for text-only BM25).
+  **Recall@50 ≈ 0.827** (up from 0.19 for text-only BM25), the last
+  increment being a small character n-gram fuzzy-matching signal on top
+  of everything else (see §0f).
 - **Real benchmark history**, tracked across five submitted iterations of
   this pipeline as the location signal was progressively refined (see
   "Errors found" for the investigation behind each step):
@@ -29,7 +31,8 @@ re-rank. Optimized for **Recall@50**.
   | 2. + location redirect (unweighted, top-1 hub) | 0.800 | 0.7408 |
   | 3. + redirect weighted by confidence | 0.804 | 0.7510 |
   | 4. + top-5 redirect hubs instead of top-1 | 0.812 | 0.7539 |
-  | 5. + guaranteed candidate expansion by location (current) | 0.823 | *pending* |
+  | 5. + guaranteed candidate expansion by location | 0.823 | *not submitted alone — continued experimenting instead, see below* |
+  | 6. + character n-gram fuzzy matching (current) | 0.827 | *pending* |
 
   Confidence weighting (iteration 3) delivered a **larger** real-world
   gain than its offline estimate predicted (+0.0102 real vs. +0.0037
@@ -255,6 +258,59 @@ single biggest offline jump since the original location boost itself
 (§0), which is exactly what you'd expect from fixing a structural blind
 spot rather than tuning a threshold inside an already-working mechanism.
 
+### 0f. Character n-gram fuzzy matching as a secondary retriever
+
+Everything through §0e still runs on exact-word BM25: a query and an item
+only connect if they share at least one identical token. That misses
+word-form variants, typos, and compound words split differently — e.g.
+the query "маникюрный мастер" and an item titled "мастер маникюра" only
+share the token "мастер" at the exact-word level, but share a large
+fraction of their 3–5-character substrings ("маникюр...") at the
+character level. This blind spot compounds with §0e specifically: items
+added purely through location expansion with a BM25 score of exactly 0
+have *no* other text signal at all, so a fuzzy character-level score is
+the only thing that can still distinguish a genuinely related item from
+a random one that merely shares a city.
+
+`src/fuzzy.py::FuzzyIndex` builds a TF-IDF index over character 3–5-grams
+(`analyzer="char_wb"`) instead of words, mirroring `BM25Index`'s API
+(`.fit()` / `.score_chunked()`) so it plugs into the same ranking loop as
+a second, independent similarity score. `max_df=0.5` matters even more
+here than for BM25: there are far fewer distinct character n-grams than
+words, so without pruning, the most common ones (fragments of common
+suffixes) appear in nearly every document and risk the same
+density/memory blow-up documented in §2/"Errors found" #4.
+
+I swept its weight (`alpha_fuzzy`) on the offline validation harness,
+on top of the full pipeline through §0e (Recall@50 = 0.8234 baseline):
+
+| alpha_fuzzy | Recall@50 |
+|---|---|
+| 0.05 | 0.8261 |
+| 0.08 | 0.8261 |
+| **0.1 (chosen)** | **0.8268** |
+| 0.12 | 0.8253 |
+| 0.15 | 0.8262 |
+| 0.2 | 0.8256 |
+| 0.3 | 0.8257 |
+| 0.5 | 0.8229 |
+| 1.0 | 0.8068 |
+| 2.0 | 0.7432 |
+
+The signal is genuinely useful but only in a narrow, low-weight band: it
+is far noisier than exact word overlap (short, semantically unrelated
+words often share many character n-grams by coincidence), so at higher
+weight it starts outranking the reliable signals (BM25, location,
+category) instead of merely filling in their blind spots. `alpha_fuzzy=0.1`
+is used in the final pipeline.
+
+**Also checked and found not to matter**: a grid search over BM25's own
+`k1`/`b` hyperparameters (the literature defaults are `k1=1.5, b=0.75`)
+found no configuration that beat the defaults on this dataset — every
+value tried scored at or below the baseline (`b=0.0` tied it exactly at
+0.8234; every other combination was strictly worse). Documented here as
+a negative result rather than left unverified.
+
 ### 1. Text preprocessing (`src/text_utils.py`)
 
 Lowercasing, `ё`→`е` normalization, a hand-written ~130-word Russian
@@ -356,7 +412,8 @@ For each query: BM25 score over the full item corpus → guarantee every
 item in the query's eligible locations is a candidate (§0e, even with a
 zero text score) → add the location-match boost (full strength for a raw
 match, confidence-weighted for each of up to 5 redirect-target matches)
-→ add the microcategory-match boost → take the top 50 by score.
+→ add the microcategory-match boost → add the character n-gram fuzzy
+score (§0f) → take the top 50 by score.
 
 ## How I validated before submitting
 
@@ -398,7 +455,8 @@ Full progression on the offline EVAL set (all numbers reproducible via
 | + location redirect, top-5 targets, weighted by confidence | 0.7942 |
 | + microcategory prior (`alpha_microcat=0.2`) | 0.8119 |
 | + historical memorization (query text only) on top of the above | 0.8113 (no gain, dropped) |
-| + guaranteed candidate expansion by location (§0e) | **0.8234** (final) |
+| + guaranteed candidate expansion by location (§0e) | 0.8234 |
+| + character n-gram fuzzy matching, `alpha_fuzzy=0.1` (§0f) | **0.8268** (final) |
 
 Real benchmark scores tracked across the actual submitted iterations of
 this pipeline (see TL;DR table too): **0.7182** (raw location match
@@ -515,9 +573,6 @@ version).
   token-repetition weighting trick — the trick is a reasonable
   approximation but a true multi-field BM25F would let title/description
   have their own document-frequency statistics.
-- **Fuzzy/typo-tolerant matching** (e.g. character n-gram TF-IDF as a
-  second retriever, unioned with BM25 candidates) for query texts with
-  no exact vocabulary overlap.
 
 ## Reproducibility notes
 
