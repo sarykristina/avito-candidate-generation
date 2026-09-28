@@ -15,14 +15,18 @@ search_is_delivery_search, search_infm_params_text, search_category);
 данного экземпляра запроса (у запроса может быть больше одного
 релевантного объявления, как и написано в условии задания).
 
-Экземпляры запроса делятся 90/10 на FIT / EVAL. FIT играет роль
-"исторического лога запросов" (на нём строится словарь/веса BM25 и
-исторические priors: запрос->объявление, запрос->микрокатегория). EVAL
-играет роль отложенных запросов бенчмарка. Это разбиение специально
-сделано реалистичным: доля запросов бенчмарка, чей текст дословно
-встречается в train.parquet, была напрямую проверена (~37%, см.
-README.md) -- то есть офлайн-валидация не является искусственно более
-лёгкой, чем реальная задача.
+Экземпляры запроса делятся на FIT / EVAL (по умолчанию 5000 экземпляров
+в EVAL -- больше, чем в первых версиях этой валидации (2000), потому что
+на 2000 запросах разница между соседними значениями alpha_microcat была
+уже сопоставима со статистическим шумом; на 5000 оценки стабильнее).
+FIT играет роль "исторического лога запросов" (на нём строится
+словарь/веса BM25 и исторические priors: запрос->объявление,
+запрос->микрокатегория, запрос->редирект локации). EVAL играет роль
+отложенных запросов бенчмарка. Это разбиение специально сделано
+реалистичным: доля запросов бенчмарка, чей текст дословно встречается в
+train.parquet, была напрямую проверена (~37%, см. README.md) -- то есть
+офлайн-валидация не является искусственно более лёгкой, чем реальная
+задача.
 
 Корпус объявлений для расчёта скора на этапе валидации -- это ВСЕ
 уникальные item_id из *целого* train.parquet (FIT+EVAL вместе): он
@@ -50,10 +54,11 @@ sys.path.insert(0, ".")
 from src.data_prep import build_item_corpus_text, build_query_text, normalize_query_text
 from src.bm25 import BM25Index
 from src.eval_utils import recall_at_k
-from src.ranking import rank_all, build_memo_prior
+from src.ranking import rank_all, build_memo_prior, build_location_redirect
 
 RNG_SEED = 42          # фиксированный seed -> разбиение FIT/EVAL воспроизводимо
 K = 50                 # то же K, что и в задании (Recall@50)
+N_EVAL = 5000          # число экземпляров запроса в EVAL (см. докстринг выше)
 CHUNK = 200            # размер чанка запросов для BM25Index.score_chunked (см. bm25.py)
 CACHE_PATH = Path("data/cache/validation_setup.pkl")
 
@@ -76,9 +81,9 @@ def build_setup(t0):
     """Один раз выполнить всю дорогую подготовку: загрузить train.parquet,
     восстановить экземпляры запроса, разбить их на FIT/EVAL, собрать текст
     корпуса объявлений и обучить на нём BM25-индекс, построить
-    FIT-прайоры (микрокатегория и локация). Результат кэшируется в
-    get_setup(), чтобы не повторять эти шаги при каждом новом эксперименте
-    с параметрами бустинга."""
+    FIT-прайоры (микрокатегория, редирект локации). Результат кэшируется
+    в get_setup(), чтобы не повторять эти шаги при каждом новом
+    эксперименте с параметрами бустинга."""
     log(t0, "Загружаю train.parquet ...")
     train = pd.read_parquet("data/train.parquet")
     log(t0, f"строк={len(train)}  уникальных объявлений={train['item_id'].nunique()}")
@@ -94,7 +99,7 @@ def build_setup(t0):
     rng = np.random.default_rng(RNG_SEED)
     unique_groups = train["_group_id"].unique()
     rng.shuffle(unique_groups)
-    n_eval = min(2000, int(0.1 * len(unique_groups)))
+    n_eval = min(N_EVAL, int(0.1 * len(unique_groups)))
     eval_groups = set(unique_groups[:n_eval])
     fit_mask = ~train["_group_id"].isin(eval_groups)
 
@@ -133,12 +138,20 @@ def build_setup(t0):
     eval_search_location = eval_query_df["search_location_id"].to_numpy()
     true_relevant = list(relevant_sets.values)
 
-    # Prior "текст запроса -> распределение микрокатегорий" строится
-    # ТОЛЬКО по FIT-строкам -- иначе мы бы подсматривали в саму EVAL-
-    # разметку при оценке качества, что сделало бы валидацию нечестной.
+    # Priors строятся ТОЛЬКО по FIT-строкам -- иначе мы бы подсматривали в
+    # саму EVAL-разметку при оценке качества, что сделало бы валидацию
+    # нечестной.
     fit_by_qtext = fit_rows.groupby("_qtext_norm")
     qtext_to_microcat = fit_by_qtext["item_microcat_id"].agg(
         lambda s: s.value_counts(normalize=True).to_dict()
+    )
+    location_redirect = build_location_redirect(
+        fit_rows["search_location_id"], fit_rows["item_location_id"]
+    )
+    eval_search_location_redirect = (
+        eval_query_df["search_location_id"].map(location_redirect)
+        .fillna(eval_query_df["search_location_id"])
+        .to_numpy()
     )
 
     setup = dict(
@@ -146,6 +159,7 @@ def build_setup(t0):
         item_location=item_location,
         eval_query_texts=eval_query_texts, eval_qtext_list=eval_qtext_list,
         eval_search_location=eval_search_location,
+        eval_search_location_redirect=eval_search_location_redirect,
         true_relevant=true_relevant, qtext_to_microcat=qtext_to_microcat,
         fit_qtext_series=fit_rows["_qtext_norm"], fit_item_series=fit_rows["item_id"],
     )
@@ -156,8 +170,8 @@ def get_setup(t0):
     """Загрузить закэшированную подготовку с диска, если она уже
     посчитана, иначе построить её заново и сохранить в кэш. Это чисто
     техническая оптимизация под итеративный подбор гиперпараметров бустов
-    (build_setup -- самая долгая часть, ~1-7 минут на полном
-    train.parquet в зависимости от загрузки системы, тогда как сам
+    (build_setup -- самая долгая часть, от ~1 до нескольких минут на
+    полном train.parquet в зависимости от загрузки системы, тогда как сам
     перебор вариантов бустинга -- секунды)."""
     if CACHE_PATH.exists():
         log(t0, f"Загружаю закэшированную подготовку из {CACHE_PATH} ...")
@@ -181,12 +195,15 @@ def main():
     # отсортирован по возрастанию.
     assert (np.sort(s["item_ids"]) == s["item_ids"]).all()
 
-    def evaluate(label, **kwargs):
+    def evaluate(label, use_redirect=True, **kwargs):
         ranked = rank_all(
             s["eval_query_texts"], s["eval_qtext_list"], s["bm25"],
             s["item_ids"], s["item_microcat"],
             item_location=s["item_location"],
             search_location_list=s["eval_search_location"],
+            search_location_redirect_list=(
+                s["eval_search_location_redirect"] if use_redirect else None
+            ),
             k=K, chunk_size=CHUNK, **kwargs,
         )
         r, _ = recall_at_k(s["true_relevant"], ranked, k=K)
@@ -198,39 +215,48 @@ def main():
     # 1) Прямая проверка гипотезы "услуги Avito - локальный рынок": какая
     #    доля выбранных в train.parquet объявлений находится ровно в той
     #    же локации, что и сам поиск.
-    match_rate = (
-        pd.read_parquet("data/train.parquet", columns=["item_location_id", "search_location_id"])
-        .pipe(lambda df: (df["item_location_id"] == df["search_location_id"]).mean())
-    )
+    loc_cols = pd.read_parquet("data/train.parquet", columns=["item_location_id", "search_location_id"])
+    match_rate = (loc_cols["item_location_id"] == loc_cols["search_location_id"]).mean()
     log(t0, f"Доля train-строк с item_location_id == search_location_id: {match_rate:.4f}")
 
     # 2) Чистый BM25 без каких-либо бустов -- отправная точка.
-    evaluate("BASELINE только текстовый BM25",
+    evaluate("BASELINE только текстовый BM25", use_redirect=False,
              qtext_to_items=empty_series, qtext_to_microcat=empty_series,
              alpha_microcat=0.0, alpha_location=0.0)
 
-    # 3) Буст по локации -- главный найденный сигнал. Проверяем, что
-    #    результат выходит на плато уже при alpha=1.0 (когда буст
-    #    гарантированно перевешивает разницу BM25-скоров внутри запроса).
+    # 3) Буст по локации (прямое совпадение) -- главный найденный сигнал.
+    #    Проверяем, что результат выходит на плато уже при alpha=1.0.
     for alpha_loc in [0.1, 0.3, 0.5, 1.0, 2.0]:
-        evaluate(f"BM25 + локация(alpha={alpha_loc})",
+        evaluate(f"BM25 + локация(alpha={alpha_loc}), без редиректа", use_redirect=False,
                  qtext_to_items=empty_series, qtext_to_microcat=empty_series,
                  alpha_microcat=0.0, alpha_location=alpha_loc)
 
-    # 4) На базе локации(1.0) подбираем буст по микрокатегории. Без
-    #    локации этот буст стабильно вредил (см. README.md) - проверяем,
-    #    изменилось ли это теперь, когда кандидат-пул уже сужен географией.
-    for alpha_mc in [0.0, 0.1, 0.15, 0.2, 0.25, 0.3, 0.5, 1.0]:
-        evaluate(f"BM25 + локация(1.0) + микрокатегория(alpha={alpha_mc})",
+    # 4) "Редирект" локации: 17.4% запросов бенчмарка не имеют в корпусе
+    #    ни одного объявления с тем же search_location_id (маленькие
+    #    города/районы без своих исполнителей) - прямой буст для них
+    #    бесполезен. Проверяем эффект отдельно и в объединении с прямым
+    #    совпадением (см. src/ranking.py, build_location_redirect).
+    evaluate("BM25 + локация(1.0) С редиректом (union)", use_redirect=True,
+             qtext_to_items=empty_series, qtext_to_microcat=empty_series,
+             alpha_microcat=0.0, alpha_location=1.0)
+
+    # 5) На базе локации(1.0)+редирект подбираем буст по микрокатегории.
+    #    Без буста по локации этот сигнал стабильно вредил (см. README.md) -
+    #    проверяем итоговый оптимум веса теперь, когда кандидат-пул уже
+    #    сужен географией.
+    for alpha_mc in [0.0, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5]:
+        evaluate(f"BM25 + локация(1.0)+редирект + микрокатегория(alpha={alpha_mc})",
+                 use_redirect=True,
                  qtext_to_items=empty_series, qtext_to_microcat=s["qtext_to_microcat"],
                  alpha_microcat=alpha_mc, alpha_location=1.0)
 
-    # 5) Меморизация поверх лучшей связки (локация + микрокатегория) -
-    #    проверяем, не потеряла ли она смысл теперь, когда локация уже
-    #    учтена явно (см. докстринг src/ranking.py).
+    # 6) Меморизация поверх лучшей связки - проверяем, не потеряла ли она
+    #    смысл теперь, когда локация (и её редирект) уже учтены явно (см.
+    #    докстринг src/ranking.py).
     best_memo = build_memo_prior(s["fit_qtext_series"], s["fit_item_series"],
                                   max_distinct=5, top_n=3)
-    evaluate("BM25 + локация(1.0) + микрокатегория(0.2) + memo(5,3)",
+    evaluate("BM25 + локация(1.0)+редирект + микрокатегория(0.2) + memo(5,3)",
+             use_redirect=True,
              qtext_to_items=best_memo, qtext_to_microcat=s["qtext_to_microcat"],
              alpha_microcat=0.2, alpha_location=1.0)
 
